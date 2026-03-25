@@ -1,23 +1,48 @@
 package fs
 
 import (
-	"context"
-	"os"
+	"sync"
+	"sync/atomic"
 
-	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
 )
 
-type FS struct{}
-
-func (FS) Root() (fs.Node, error) {
-	return Dir{}, nil
+type FS struct {
+	Debug bool
 }
 
-type Dir struct{}
+var inodeCounter uint64 = 2
 
-func (Dir) Attr(ctx context.Context, a *fuse.Attr) error {
-	a.Inode = 1                 //inode 1 cuz root
-	a.Mode = os.ModeDir | 0o755 //octal perms for rwx r-x r-x
-	return nil
+func nextInode() uint64 {
+	return atomic.AddUint64(&inodeCounter, 1)
+}
+
+func (f *FS) Root() (fs.Node, error) {
+	root := &Dir{
+		inode: 1,
+		Nodes: map[string]fs.Node{
+			"hello.txt": &File{
+				inode: nextInode(),
+				data:  []byte("Hello from minionfs!\n"),
+				mode:  0o666,
+			},
+		},
+		fs: f,
+	}
+
+	return root, nil
+}
+
+type File struct {
+	mu    sync.Mutex
+	inode uint64
+	data  []byte
+	mode  uint32
+}
+
+type Dir struct {
+	mu    sync.Mutex
+	inode uint64
+	Nodes map[string]fs.Node
+	fs    *FS
 }

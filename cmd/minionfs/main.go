@@ -1,40 +1,76 @@
 package main
 
 import (
+	"flag"
 	"fmt"
+	"log"
 	"os"
+	"os/exec"
+	"os/signal"
 
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
 	minionfs "github.com/Prana-vvb/minionfs/internal/fs"
 )
 
+type config struct {
+	debug bool
+	mount string
+}
+
 func main() {
-	if len(os.Args) != 2 {
-		fmt.Println("Invalid usage. Use go run main.go <mntpoint>")
+	debug := flag.Bool("d", false, "Enable debug mode")
+	flag.Parse()
+
+	if flag.NArg() < 1 {
+		fmt.Println("usage: go run cmd/minionfs/main.go [-d] <mountpoint>")
 		return
 	}
 
-	mount_point := os.Args[1]
+	cfg := &config{
+		debug: *debug,
+		mount: flag.Arg(0),
+	}
+
+	if cfg.debug {
+		log.Println("Debug mode enabled")
+	}
 
 	//c is a fuse connection to dev/fuse
-	c, err := fuse.Mount(mount_point)
+	c, err := fuse.Mount(cfg.mount)
 
 	if err != nil {
-		fmt.Println(err)
+		log.Println(err)
+		return
+	}
+	defer c.Close()
+
+	serv := make(chan error, 1)
+	go func() {
+		serv <- fs.Serve(c, &minionfs.FS{Debug: cfg.debug})
+	}()
+
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt)
+
+	<-signals
+	log.Println("Interrupt received: shutting down.")
+	unmount_err := fuse.Unmount(cfg.mount)
+
+	if unmount_err != nil {
+		log.Println("Lazy Unmounting")
+		command := exec.Command("fusermount", "-u", "-z", cfg.mount)
+		cmd_err := command.Run()
+
+		if cmd_err != nil {
+			log.Println(cmd_err)
+			return
+		}
+
 		return
 	}
 
-	defer c.Close() //delay execution of Close
-
-	err = fs.Serve(c, minionfs.FS{}) //starts listening for FS reqs
-
-	if err != nil {
-		fmt.Println(err)
+	if err := <-serv; err != nil {
+		log.Println("Serve error:", err)
 	}
-
-	// <-c.Ready
-	// if err := c.MountError; err != nil {
-	// 	fmt.Println(err)
-	// }
 }
