@@ -9,7 +9,9 @@ import (
 )
 
 type FS struct {
-	Debug bool
+	Debug    bool
+	UpperDir string
+	LowerDir string
 }
 
 var inodeCounter uint64 = 2
@@ -31,7 +33,9 @@ func (f *FS) Root() (fs.Node, error) {
 				ctime: time.Now(),
 			},
 		},
-		fs: f,
+		upperDir: f.UpperDir,
+		lowerDir: f.LowerDir,
+		fs:       f,
 	}
 
 	return root, nil
@@ -48,8 +52,9 @@ type File struct {
 }
 
 type Dir struct {
-	mu    sync.Mutex
-	inode uint64
-	Nodes map[string]fs.Node
-	fs    *FS
+	mu       sync.Mutex
+	inode    uint64
+	upperDir string
+	lowerDir string
+	fs       *FS
 }

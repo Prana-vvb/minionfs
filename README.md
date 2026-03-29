@@ -18,6 +18,6 @@ Available recipes:
     clean               # [alias: c]
     default             # Shows this help menu
     # Runs the application on the specified mount point without or with debug logs
-    # Args: /path/to/mountpoint [-d]
-    run mntpoint dbg="" # [alias: r]
+    # Args: /path/to/mountpoint /path/to/lowerDir /path/to/upperDir [-d]
+    run mntpoint ldir udir dbg="" # [alias: r]
 ```

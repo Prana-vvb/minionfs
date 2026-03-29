@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -16,6 +17,23 @@ func (f *FS) DebugPrint(msg string, v ...any) {
 		logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 		logger.Info(msg, v...)
 	}
+}
+
+func (d *Dir) resolvePath(name string) (fullPath string, layer string, err error) {
+	upperPath := filepath.Join(d.upperDir, name)
+	lowerPath := filepath.Join(d.lowerDir, name)
+
+	// Check upper layer first
+	if _, err := os.Lstat(upperPath); err == nil {
+		return upperPath, "upper", nil
+	}
+
+	// Fall back to lower layer
+	if _, err := os.Lstat(lowerPath); err == nil {
+		return lowerPath, "lower", nil
+	}
+
+	return "", "", syscall.ENOENT
 }
 
 func (d *Dir) Attr(ctx context.Context, a *fuse.Attr) error {
@@ -31,13 +49,37 @@ func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	node, ok := d.Nodes[name]
-
-	if !ok {
+	fullPath, layer, err := d.resolvePath(name)
+	if err != nil {
 		return nil, syscall.ENOENT
 	}
 
-	return node, nil
+	d.fs.DebugPrint("LOOKUP", "found", name, "in layer", layer, "at", fullPath)
+
+	info, err := os.Lstat(fullPath)
+	if err != nil {
+		return nil, syscall.ENOENT
+	}
+
+	if info.IsDir() {
+		return &Dir{
+			inode:    nextInode(),
+			upperDir: filepath.Join(d.upperDir, name),
+			lowerDir: filepath.Join(d.lowerDir, name),
+			fs:       d.fs,
+		}, nil
+	}
+
+	data, err := os.ReadFile(fullPath)
+	if err != nil {
+		return nil, syscall.EIO
+	}
+
+	return &File{
+		inode: nextInode(),
+		data:  data,
+		mode:  uint32(info.Mode()),
+	}, nil
 }
 
 func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
@@ -46,21 +88,39 @@ func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	var entries []fuse.Dirent
-	for name, node := range d.Nodes {
-		var dt fuse.DirentType
+	// Use a map to merge entries. upper layer wins on name collision
+	seen := make(map[string]fuse.DirentType)
 
-		switch node.(type) {
-		case *Dir:
-			dt = fuse.DT_Dir
-		default:
-			dt = fuse.DT_File
+	// Read upper layer
+	if entries, err := os.ReadDir(d.upperDir); err == nil {
+		for _, e := range entries {
+			if e.IsDir() {
+				seen[e.Name()] = fuse.DT_Dir
+			} else {
+				seen[e.Name()] = fuse.DT_File
+			}
 		}
-
-		entries = append(entries, fuse.Dirent{Name: name, Type: dt})
 	}
 
-	return entries, nil
+	// Read lower layer. skip names already in upper
+	if entries, err := os.ReadDir(d.lowerDir); err == nil {
+		for _, e := range entries {
+			if _, exists := seen[e.Name()]; !exists {
+				if e.IsDir() {
+					seen[e.Name()] = fuse.DT_Dir
+				} else {
+					seen[e.Name()] = fuse.DT_File
+				}
+			}
+		}
+	}
+
+	var dirents []fuse.Dirent
+	for name, dt := range seen {
+		dirents = append(dirents, fuse.Dirent{Name: name, Type: dt})
+	}
+
+	return dirents, nil
 }
 
 func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error) {
@@ -76,12 +136,21 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	if _, exists := d.Nodes[req.Name]; exists {
-		return nil, syscall.EEXIST
+	newUpperPath := filepath.Join(d.upperDir, req.Name)
+
+	if err := os.Mkdir(newUpperPath, req.Mode); err != nil {
+		if os.IsExist(err) {
+			return nil, syscall.EEXIST
+		}
+		return nil, syscall.EIO
 	}
 
-	newDir := &Dir{inode: nextInode(), Nodes: make(map[string]fs.Node), fs: d.fs}
-	d.Nodes[req.Name] = newDir
+	newDir := &Dir{
+		inode:    nextInode(),
+		upperDir: newUpperPath,
+		lowerDir: filepath.Join(d.lowerDir, req.Name),
+		fs:       d.fs,
+	}
 
 	return newDir, nil
 }
@@ -99,6 +168,14 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
+
+	upperPath := filepath.Join(d.upperDir, req.Name)
+
+	osFile, err := os.OpenFile(upperPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, req.Mode)
+	if err != nil {
+		return nil, nil, syscall.EIO
+	}
+	osFile.Close()
 
 	f := &File{
 		inode: nextInode(),
@@ -126,17 +203,11 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	if _, exists := d.Nodes[req.Name]; !exists {
-		return syscall.ENOENT
+	upperPath := filepath.Join(d.upperDir, req.Name)
+
+	if _, err := os.Lstat(upperPath); err == nil {
+		return os.Remove(upperPath)
 	}
 
-	if dir, flag := d.Nodes[req.Name].(*Dir); flag {
-		if len(dir.Nodes) > 0 {
-			return syscall.ENOTEMPTY
-		}
-	}
-
-	delete(d.Nodes, req.Name)
-
-	return nil
+	return syscall.ENOENT
 }
