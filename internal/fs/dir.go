@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"syscall"
+	"time"
 
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
@@ -99,7 +100,14 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	f := &File{inode: nextInode(), data: []byte{}, mode: uint32(req.Mode)}
+	f := &File{
+		inode: nextInode(),
+		data:  []byte{},
+		mode:  uint32(req.Mode),
+		atime: time.Now(),
+		ctime: time.Now(),
+		mtime: time.Now(),
+	}
 	d.Nodes[req.Name] = f
 
 	return f, f, nil

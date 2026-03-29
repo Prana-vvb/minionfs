@@ -3,6 +3,7 @@ package fs
 import (
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"bazil.org/fuse/fs"
 )
@@ -25,6 +26,9 @@ func (f *FS) Root() (fs.Node, error) {
 				inode: nextInode(),
 				data:  []byte("Hello from minionfs!\n"),
 				mode:  0o666,
+				atime: time.Now(),
+				mtime: time.Now(),
+				ctime: time.Now(),
 			},
 		},
 		fs: f,
@@ -38,6 +42,9 @@ type File struct {
 	inode uint64
 	data  []byte
 	mode  uint32
+	atime time.Time
+	mtime time.Time
+	ctime time.Time
 }
 
 type Dir struct {
