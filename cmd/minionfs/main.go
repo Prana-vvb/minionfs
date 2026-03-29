@@ -14,31 +14,43 @@ import (
 )
 
 type config struct {
-	debug bool
-	mount string
+	debug    bool
+	lowerDir string
+	upperDir string
+	mount    string
 }
 
 func main() {
 	debug := flag.Bool("d", false, "Enable debug mode")
 	flag.Parse()
 
-	if flag.NArg() < 1 {
-		fmt.Println("usage: go run cmd/minionfs/main.go [-d] <mountpoint>")
+	if flag.NArg() < 3 {
+		fmt.Println("usage: minionfs [-d] <lowerdir> <upperdir> <mountpoint>")
 		return
 	}
 
 	cfg := &config{
-		debug: *debug,
-		mount: flag.Arg(0),
+		debug:    *debug,
+		lowerDir: flag.Arg(0),
+		upperDir: flag.Arg(1),
+		mount:    flag.Arg(2),
+	}
+
+	// Make sure upper and lower dirs actually exist
+	for _, dir := range []string{cfg.lowerDir, cfg.upperDir} {
+		if _, err := os.Stat(dir); err != nil {
+			log.Fatalf("Directory does not exist: %s", dir)
+		}
 	}
 
 	if cfg.debug {
 		log.Println("Debug mode enabled")
+		log.Printf("Lower dir: %s", cfg.lowerDir)
+		log.Printf("Upper dir: %s", cfg.upperDir)
+		log.Printf("Mountpoint: %s", cfg.mount)
 	}
 
-	//c is a fuse connection to dev/fuse
 	c, err := fuse.Mount(cfg.mount)
-
 	if err != nil {
 		log.Println(err)
 		return
@@ -47,7 +59,11 @@ func main() {
 
 	serv := make(chan error, 1)
 	go func() {
-		serv <- fs.Serve(c, &minionfs.FS{Debug: cfg.debug})
+		serv <- fs.Serve(c, &minionfs.FS{
+			Debug:    cfg.debug,
+			UpperDir: cfg.upperDir,
+			LowerDir: cfg.lowerDir,
+		})
 	}()
 
 	signals := make(chan os.Signal, 1)

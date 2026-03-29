@@ -2,5 +2,5 @@
 
 Mount filesystem
 ```
-go run ./cmd/minionfs/main.go /path/to/mountpoint
+go run ./cmd/minionfs/main.go /path/to/lowerDir /path/to/upperDir /path/to/mountpoint
 ```

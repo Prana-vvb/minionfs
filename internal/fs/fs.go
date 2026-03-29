@@ -8,7 +8,9 @@ import (
 )
 
 type FS struct {
-	Debug bool
+	Debug    bool
+	UpperDir string
+	LowerDir string
 }
 
 var inodeCounter uint64 = 2
@@ -19,15 +21,10 @@ func nextInode() uint64 {
 
 func (f *FS) Root() (fs.Node, error) {
 	root := &Dir{
-		inode: 1,
-		Nodes: map[string]fs.Node{
-			"hello.txt": &File{
-				inode: nextInode(),
-				data:  []byte("Hello from minionfs!\n"),
-				mode:  0o666,
-			},
-		},
-		fs: f,
+		inode:    1,
+		upperDir: f.UpperDir,
+		lowerDir: f.LowerDir,
+		fs:       f,
 	}
 
 	return root, nil
@@ -41,8 +38,9 @@ type File struct {
 }
 
 type Dir struct {
-	mu    sync.Mutex
-	inode uint64
-	Nodes map[string]fs.Node
-	fs    *FS
+	mu       sync.Mutex
+	inode    uint64
+	upperDir string
+	lowerDir string
+	fs       *FS
 }
