@@ -69,6 +69,13 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 	copy(f.data[req.Offset:], req.Data)
 	resp.Size = len(req.Data)
 
+	// Persist to disk immediately after every write
+	if f.upperPath != "" {
+		if err := os.WriteFile(f.upperPath, f.data, os.FileMode(f.mode)); err != nil {
+			return syscall.EIO
+		}
+	}
+
 	return nil
 }
 
