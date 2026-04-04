@@ -31,10 +31,12 @@ func (f *FS) Root() (fs.Node, error) {
 }
 
 type File struct {
-	mu    sync.Mutex
-	inode uint64
-	data  []byte
-	mode  uint32
+	mu        sync.Mutex
+	inode     uint64
+	data      []byte
+	mode      uint32
+	upperPath string // where this file lives (or should live) in the upper layer
+	lowerPath string // where this file lives in the lower layer (empty if upper-only)
 }
 
 type Dir struct {
