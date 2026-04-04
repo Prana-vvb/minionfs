@@ -75,9 +75,11 @@ func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 	}
 
 	return &File{
-		inode: nextInode(),
-		data:  data,
-		mode:  uint32(info.Mode()),
+		inode:     nextInode(),
+		data:      data,
+		mode:      uint32(info.Mode()),
+		upperPath: filepath.Join(d.upperDir, name),
+		lowerPath: filepath.Join(d.lowerDir, name),
 	}, nil
 }
 
@@ -177,9 +179,10 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 	osFile.Close()
 
 	f := &File{
-		inode: nextInode(),
-		data:  []byte{},
-		mode:  uint32(req.Mode),
+		inode:     nextInode(),
+		data:      []byte{},
+		mode:      uint32(req.Mode),
+		upperPath: upperPath,
 	}
 
 	return f, f, nil
