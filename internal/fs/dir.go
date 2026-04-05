@@ -26,6 +26,17 @@ func isWhiteout(upperDir, name string) bool {
 	return err == nil
 }
 
+// createWhiteout creates a whiteout marker file in the upper layer to hide
+// a file that exists only in the lower layer.
+func createWhiteout(upperDir, name string) error {
+	whiteoutPath := filepath.Join(upperDir, whiteoutPrefix+name)
+	f, err := os.Create(whiteoutPath)
+	if err != nil {
+		return err
+	}
+	return f.Close()
+}
+
 func (d *Dir) resolvePath(name string) (fullPath string, layer string, err error) {
 	// Step 1: Check for whiteout in upper layer first.
 	// If a whiteout exists, the file is considered deleted.
@@ -224,13 +235,20 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 	return f, f, nil
 }
 
+// Remove handles file and directory deletion with whiteout support.
+//
+// Cases:
+//  1. File exists in upper layer only   → delete it directly.
+//  2. File exists in both layers        → delete upper copy, create whiteout to hide lower copy.
+//  3. File exists in lower layer only   → create a whiteout marker in the upper layer to hide it.
+//  4. File does not exist in any layer  → return ENOENT.
 func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 	d.fs.DebugPrint(
 		"REMOVE",
 		"ID", req.ID,
 		"Is this a directory?", req.Dir,
 		"Removing file/dir", req.Name,
-		"NodeID", req.ID,
+		"NodeID", req.Node,
 		"Request PID", req.Pid,
 	)
 
@@ -238,10 +256,45 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 	defer d.mu.Unlock()
 
 	upperPath := filepath.Join(d.upperDir, req.Name)
+	lowerPath := filepath.Join(d.lowerDir, req.Name)
 
+	inUpper := false
 	if _, err := os.Lstat(upperPath); err == nil {
-		return os.Remove(upperPath)
+		inUpper = true
 	}
 
-	return syscall.ENOENT
+	inLower := false
+	if d.lowerDir != "" {
+		if _, err := os.Lstat(lowerPath); err == nil {
+			inLower = true
+		}
+	}
+
+	if !inUpper && !inLower {
+		return syscall.ENOENT
+	}
+
+	// Remove the upper copy if it exists (file or directory)
+	if inUpper {
+		var removeErr error
+		if req.Dir {
+			removeErr = os.RemoveAll(upperPath)
+		} else {
+			removeErr = os.Remove(upperPath)
+		}
+		if removeErr != nil {
+			return syscall.EIO
+		}
+	}
+
+	// If the entry also existed in the lower layer, create a whiteout so it
+	// stays hidden in the merged view.
+	if inLower {
+		if err := createWhiteout(d.upperDir, req.Name); err != nil {
+			return syscall.EIO
+		}
+		d.fs.DebugPrint("REMOVE", "created whiteout for", req.Name)
+	}
+
+	return nil
 }
