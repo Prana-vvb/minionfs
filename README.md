@@ -134,7 +134,7 @@ fusermount -u mnt/
 just build
 
 # Or directly
-go build -o minionfs cmd/minionfs/main.go
+go build cmd/minionfs/main.go
 ```
 
 ---
@@ -146,6 +146,9 @@ go build -o minionfs cmd/minionfs/main.go
 Run the Go unit tests with coverage:
  
 ```bash
+# Run all tests
+just test
+
 # Summary percentage
 go test ./internal/fs/ -cover
  
