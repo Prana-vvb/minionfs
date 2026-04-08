@@ -183,3 +183,50 @@ func TestGzipCodec_Roundtrip(t *testing.T) {
 		t.Fatalf("Expected plain size %d, got %d", len(data), size)
 	}
 }
+
+// TestChunkedAES_CorruptShortPayload verifies that readChunk returns an error
+// when a chunk has a non-zero payload shorter than NonceSize+TagSize (28 bytes).
+// This hits the length guard that protects against truncated cipher chunks.
+func TestChunkedAES_CorruptShortPayload(t *testing.T) {
+	f := tempFile(t)
+	defer f.Close()
+
+	// Write a valid AES header followed by 10 non-zero bytes, which is fewer
+	// than the minimum decodable chunk size (NonceSize + TagSize = 28).
+	header := make([]byte, HeaderSize)
+	copy(header, magicPrefix)
+	header[HeaderSize-1] = typeAES
+	f.WriteAt(header, 0)
+
+	nonZeroPayload := bytes.Repeat([]byte{0xFF}, 10)
+	f.WriteAt(nonZeroPayload, int64(HeaderSize))
+
+	codec := NewChunkedAES("key")
+	buf := make([]byte, 10)
+	_, err := codec.ReadAt(f, buf, 0)
+	if err == nil {
+		t.Fatal("expected error reading corrupt short-payload chunk, got nil")
+	}
+}
+
+// TestGzipCodec_CorruptCompressedData verifies that ReadAt returns an error
+// when the file has a valid gzip magic header but the compressed body is
+// garbage (i.e. gzip.NewReader fails to parse it).
+func TestGzipCodec_CorruptCompressedData(t *testing.T) {
+	f := tempFile(t)
+	defer f.Close()
+
+	// Write valid magic header with typeGzip, then corrupt (non-gzip) bytes.
+	header := make([]byte, magicLen)
+	copy(header, magicPrefix)
+	header[magicLen-1] = typeGzip
+	payload := append(header, []byte("this is not valid gzip data")...)
+	f.WriteAt(payload, 0)
+
+	codec := GzipCodec{}
+	buf := make([]byte, 10)
+	_, err := codec.ReadAt(f, buf, 0)
+	if err == nil {
+		t.Fatal("expected error reading corrupt gzip data, got nil")
+	}
+}
