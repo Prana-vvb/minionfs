@@ -1,3 +1,4 @@
+minionfs
 main
 *.out
 *.exe
@@ -8,6 +9,7 @@ mnt/
 test/
 lower/
 upper/
+bin/
 
 **/.DS_Store
 

@@ -1,7 +1,7 @@
 # MinionFS — Mini UnionFS
 
 A lightweight Union Filesystem built with Go and FUSE (Filesystem in Userspace).  
-MinionFS merges a read-only lower layer and a writable upper layer into a single unified directory view, implementing the core semantics of a production overlay filesystem (like OverlayFS).
+MinionFS merges a read-only lower layer and a writable upper layer into a single unified directory view, implementing the core semantics of a production overlay filesystem (like OverlayFS). It optionally supports AES-256-GCM block encryption or gzip compression on the upper layer.
 
 ---
 
@@ -12,6 +12,7 @@ MinionFS merges a read-only lower layer and a writable upper layer into a single
    - [Layer Merging](#layer-merging)
    - [Copy-on-Write](#copy-on-write)
    - [Whiteouts](#whiteouts)
+   - [File Codecs](#file-codecs)
 3. [Usage](#usage)
 4. [Building](#building)
 5. [Testing](#testing)
@@ -36,11 +37,16 @@ MinionFS merges a read-only lower layer and a writable upper layer into a single
     ┌──────┴──┐  ┌┴────────┐
     │  Upper  │  │  Lower  │
     │ (R + W) │  │  (R/O)  │
-    └─────────┘  └─────────┘
+    └────┬────┘  └─────────┘
+         │
+    ┌────┴────────┐
+    │  FileCodec  │  ← PlainCodec / ChunkedAES / GzipCodec
+    └─────────────┘
 ```
 
 The upper directory is the writable layer. All mutations (creates, writes, deletes) land here.  
-The lower directory is the read-only base layer. It is never modified.
+The lower directory is the read-only base layer. It is never modified.  
+An optional codec is applied at the upper-layer disk boundary for encryption or compression.
 
 ---
 
@@ -61,7 +67,7 @@ This means the merged view contains the union of both layers, with upper taking 
 
 The lower layer is never written to directly. When a user writes to a file that exists only in the lower layer, MinionFS automatically:
 
-1. Copies the file from the lower layer to the upper layer.
+1. Copies the file from the lower layer to the upper layer (re-encoding through the active codec if needed).
 2. Applies the write to the upper copy.
 
 All subsequent reads and writes go to the upper copy. The lower original is untouched.
@@ -90,22 +96,38 @@ The merged view will no longer show `hello.txt`. The lower directory is unchange
 
 Whiteout markers are always hidden from the merged directory listing — users never see `.wh.*` files.
 
+### File Codecs
+
+MinionFS supports pluggable codecs applied at the upper-layer disk boundary via the `FileCodec` interface. All codecs support O(1)-style random-access reads and writes.
+
+| Codec | Flag | Description |
+|---|---|---|
+| `PlainCodec` | *(default)* | No encoding — upper layer stored as-is. |
+| `ChunkedAES` | `--encrypt-key=<passphrase>` | AES-256-GCM block encryption. Data is split into 4 KB plaintext chunks, each independently encrypted with a random nonce. Supports random-access reads and writes without decrypting the whole file. |
+| `GzipCodec` | `--compress` | Gzip compression. Stream-based; loads the full file into memory for each read or write. Not optimised for random access. |
+
+**Codec mutual exclusivity:** `--encrypt-key` and `--compress` cannot be used together.
+
+**Auto-detection:** When a lower-layer file is opened, MinionFS inspects the first 5 bytes for a magic header (`MFS\x00` + type byte) and selects the appropriate codec automatically. Files without this header are read as plaintext regardless of the active upper-layer codec.
+
 ---
 
 ## Usage
 
 ```bash
-minionfs [-d] <lowerdir> <upperdir> <mountpoint>
+minionfs [-d] [--encrypt-key=<passphrase>] [--compress] <lowerdir> <upperdir> <mountpoint>
 ```
 
 | Argument | Description |
 |---|---|
 | `-d` | Enable debug logging (optional) |
+| `--encrypt-key=<passphrase>` | Enable AES-256-GCM block encryption on the upper layer (optional) |
+| `--compress` | Enable gzip compression on the upper layer (optional) |
 | `<lowerdir>` | Path to the read-only base layer directory |
 | `<upperdir>` | Path to the writable upper layer directory |
 | `<mountpoint>` | Path where the merged filesystem will be mounted |
 
-**Example:**
+**Basic example:**
 ```bash
 mkdir lower upper mnt
 
@@ -113,9 +135,19 @@ echo "base file" > lower/base.txt
 
 minionfs lower/ upper/ mnt/
 
-ls mnt/              # shows base.txt
+ls mnt/                        # shows base.txt
 echo "edit" >> mnt/base.txt    # triggers Copy-on-Write → upper/base.txt is created
 rm mnt/base.txt                # creates upper/.wh.base.txt
+```
+
+**Encrypted upper layer:**
+```bash
+minionfs --encrypt-key="mysecretpassphrase" lower/ upper/ mnt/
+```
+
+**Compressed upper layer:**
+```bash
+minionfs --compress lower/ upper/ mnt/
 ```
 
 To unmount:
@@ -134,34 +166,35 @@ fusermount -u mnt/
 just build
 
 # Or directly
-go build cmd/minionfs/main.go
+go build -o bin/minionfs ./cmd/minionfs
 ```
 
 ---
 
 ## Testing
- 
+
 ### Unit Tests
- 
+
 Run the Go unit tests with coverage:
- 
+
 ```bash
 # Run all tests
 just test
 
 # Summary percentage
 go test ./internal/fs/ -cover
- 
+
 # Per-function breakdown
 go test ./internal/fs/ -coverprofile=coverage.out && go tool cover -func=coverage.out
- 
+
 # Interactive HTML coverage report
 go test ./internal/fs/ -coverprofile=coverage.out && go tool cover -html=coverage.out
 ```
- 
- 
+
+---
+
 ## File Structure
- 
+
 ```
 minionfs/
 ├── cmd/
@@ -173,11 +206,12 @@ minionfs/
 │       ├── dir.go           # Directory operations: Lookup, ReadDirAll, Mkdir,
 │       │                    #   Create, Remove (with whiteout logic)
 │       ├── file.go          # File operations: Read, Write (CoW), Flush, Fsync
+│       ├── codec.go         # FileCodec interface: PlainCodec, ChunkedAES (AES-256-GCM
+│       │                    #   block encryption), GzipCodec (stream compression)
 │       ├── fs_test.go       # Shared test helpers + FS root tests
 │       ├── dir_test.go      # Unit tests for directory operations
-│       └── file_test.go     # Unit tests for file operations
-├── lower/                   # Example lower (base) layer
-├── upper/                   # Example upper (writable) layer
+│       ├── file_test.go     # Unit tests for file operations
+│       └── codec_test.go    # Unit tests for codec roundtrips and edge cases
 ├── go.mod
 ├── go.sum
 ├── Justfile
