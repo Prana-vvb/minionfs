@@ -1,6 +1,7 @@
 package fs
 
 import (
+	"os"
 	"sync"
 	"sync/atomic"
 
@@ -11,10 +12,9 @@ type FS struct {
 	Debug    bool
 	UpperDir string
 	LowerDir string
-	Codec    FileCodec // nil means PlainCodec (no encoding)
+	Codec    FileCodec // nil means PlainCodec
 }
 
-// getCodec returns the configured codec, defaulting to PlainCodec.
 func (f *FS) getCodec() FileCodec {
 	if f.Codec == nil {
 		return PlainCodec{}
@@ -42,12 +42,11 @@ func (f *FS) Root() (fs.Node, error) {
 type File struct {
 	mu        sync.Mutex
 	inode     uint64
-	data      []byte    // always plaintext in memory
 	mode      uint32
-	upperPath string    // where this file lives (or should live) in the upper layer
-	lowerPath string    // where this file lives in the lower layer (empty if upper-only)
+	upperPath string
+	lowerPath string
 	codec     FileCodec
-	dirty     bool      // true once Write or Setattr has modified f.data / f.mode
+	fd        *os.File
 }
 
 type Dir struct {

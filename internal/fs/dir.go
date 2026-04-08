@@ -134,18 +134,9 @@ func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 		}, nil
 	}
 
-	rawData, err := os.ReadFile(fullPath)
-	if err != nil {
-		return nil, syscall.EIO
-	}
-	plaintext, err := DecodeFromDisk(rawData, d.fs.getCodec())
-	if err != nil {
-		return nil, syscall.EIO
-	}
-
+	// Return a lazily initialized File. We NO LONGER read the entire file into memory here!
 	return &File{
 		inode:     nextInode(),
-		data:      plaintext,
 		mode:      uint32(info.Mode()),
 		upperPath: filepath.Join(d.upperDir, name),
 		lowerPath: filepath.Join(d.lowerDir, name),
@@ -289,7 +280,6 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 
 	f := &File{
 		inode:     nextInode(),
-		data:      []byte{},
 		mode:      uint32(req.Mode),
 		upperPath: upperPath,
 		codec:     d.fs.getCodec(),

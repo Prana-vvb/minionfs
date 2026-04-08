@@ -1,7 +1,9 @@
 package fs
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"os"
 	"syscall"
 
@@ -12,14 +14,88 @@ import (
 func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
 	a.Inode = f.inode
 	a.Mode = os.FileMode(f.mode)
-	a.Size = uint64(len(f.data)) // plaintext size — what the OS sees
+
+	// Dynamically determine physical file path
+	var path string
+	if f.upperPath != "" {
+		if _, err := os.Stat(f.upperPath); err == nil {
+			path = f.upperPath
+		} else {
+			path = f.lowerPath
+		}
+	} else {
+		path = f.lowerPath
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	// Auto-detect if lower layer has a different codec
+	activeCodec := f.codec
+	header := make([]byte, 5)
+	n, _ := file.ReadAt(header, 0)
+	if n == 5 && bytes.Equal(header[:4], magicPrefix) {
+		if header[4] == typeGzip {
+			activeCodec = GzipCodec{}
+		}
+	} else {
+		if path == f.lowerPath {
+			activeCodec = PlainCodec{}
+		}
+	}
+
+	size, err := activeCodec.PlaintextSize(file)
+	if err != nil {
+		return err
+	}
+	a.Size = uint64(size)
 
 	return nil
 }
 
 func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (fs.Handle, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	var path string
+	if f.upperPath != "" {
+		if _, err := os.Stat(f.upperPath); err == nil {
+			path = f.upperPath
+		} else if f.lowerPath != "" {
+			path = f.lowerPath
+		}
+	} else if f.lowerPath != "" {
+		path = f.lowerPath
+	}
+
+	flags := int(req.Flags)
+
+	// Proactive Copy-on-Write for write-requests on lower files
+	if (flags&os.O_RDWR != 0 || flags&os.O_WRONLY != 0) && path == f.lowerPath {
+		if err := copyAndEncodeChunked(f.lowerPath, f.upperPath, f.codec); err != nil {
+			return nil, err
+		}
+		path = f.upperPath
+		flags = os.O_RDWR
+	}
+
+	// Chunked AES requires O_RDWR for Read-Modify-Write functionality
+	openFlags := flags
+	if path == f.upperPath {
+		openFlags = os.O_RDWR | os.O_CREATE
+	}
+
+	file, err := os.OpenFile(path, openFlags, os.FileMode(f.mode))
+	if err != nil {
+		return nil, err
+	}
+	f.fd = file
 	return f, nil
 }
 
@@ -27,126 +103,174 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadR
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	if req.Offset >= int64(len(f.data)) {
-		resp.Data = []byte{}
-		return nil
+	if f.fd == nil {
+		return syscall.EBADF
 	}
 
-	end := req.Offset + int64(req.Size)
-	end = min(end, int64(len(f.data)))
-	resp.Data = f.data[req.Offset:end]
-
-	return nil
-}
-
-// Write updates the in-memory buffer and immediately persists the encoded
-// result to the upper layer. If the file exists only in the lower layer,
-// Copy-on-Write is triggered first: the lower file is encoded and copied
-// to the upper layer before the write proceeds.
-func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	// Copy-on-Write: upper file doesn't exist yet → copy lower → upper (encoded).
-	if f.upperPath != "" {
-		if _, err := os.Lstat(f.upperPath); os.IsNotExist(err) {
-			if err := copyAndEncode(f.lowerPath, f.upperPath, f.codec); err != nil {
-				return syscall.EIO
+	// Evaluate lower file codecs
+	activeCodec := f.codec
+	if f.fd.Name() == f.lowerPath {
+		header := make([]byte, 5)
+		n, _ := f.fd.ReadAt(header, 0)
+		if n == 5 && bytes.Equal(header[:4], magicPrefix) {
+			if header[4] == typeGzip {
+				activeCodec = GzipCodec{}
 			}
+		} else {
+			activeCodec = PlainCodec{}
 		}
 	}
 
-	// Grow the buffer if the write extends beyond the current size.
-	end := req.Offset + int64(len(req.Data))
-	if end > int64(len(f.data)) {
-		newData := make([]byte, end)
-		copy(newData, f.data)
-		f.data = newData
+	buf := make([]byte, req.Size)
+	n, err := activeCodec.ReadAt(f.fd, buf, req.Offset)
+	if err != nil && err != io.EOF {
+		return err
 	}
-
-	copy(f.data[req.Offset:], req.Data)
-	resp.Size = len(req.Data)
-	f.dirty = true
-
-	// Persist encoded data to the upper layer immediately.
-	if err := f.persistLocked(); err != nil {
-		return syscall.EIO
-	}
-
+	resp.Data = buf[:n]
 	return nil
 }
 
-// Setattr handles chmod, truncate, etc.
+func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.fd == nil {
+		return syscall.EBADF
+	}
+
+	// Reactive Copy-on-Write (in case file was opened O_RDONLY and suddenly written to)
+	if f.fd.Name() == f.lowerPath {
+		f.fd.Close()
+		if err := copyAndEncodeChunked(f.lowerPath, f.upperPath, f.codec); err != nil {
+			return err
+		}
+		file, err := os.OpenFile(f.upperPath, os.O_RDWR, os.FileMode(f.mode))
+		if err != nil {
+			return err
+		}
+		f.fd = file
+	}
+
+	// Resolved Conflict 1: Use chunking's WriteAt directly to disk. Discard in-memory f.data logic.
+	n, err := f.codec.WriteAt(f.fd, req.Data, req.Offset)
+	if err != nil {
+		return err
+	}
+	
+	resp.Size = n
+	return nil
+}
+
 func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	if req.Valid.Mode() {
 		f.mode = uint32(req.Mode)
-		f.dirty = true
+		// Resolved Conflict 2: Keep the proactive chmod to the underlying file
+		if f.fd != nil {
+			f.fd.Chmod(os.FileMode(f.mode))
+		} else if f.upperPath != "" {
+			os.Chmod(f.upperPath, os.FileMode(f.mode))
+		}
 	}
 
 	if req.Valid.Size() {
-		if req.Size < uint64(len(f.data)) {
-			f.data = f.data[:req.Size]
+		if f.fd == nil {
+			if f.upperPath == "" {
+				return syscall.EBADF
+			}
+			file, err := os.OpenFile(f.upperPath, os.O_RDWR, os.FileMode(f.mode))
+			if err != nil {
+				return err
+			}
+			defer file.Close()
+			if err := f.codec.Truncate(file, int64(req.Size)); err != nil {
+				return err
+			}
 		} else {
-			newData := make([]byte, req.Size)
-			copy(newData, f.data)
-			f.data = newData
+			if err := f.codec.Truncate(f.fd, int64(req.Size)); err != nil {
+				return err
+			}
 		}
-		f.dirty = true
+		// Note: f.dirty removed here too, as chunking invalidates the need for it.
 	}
-
-	resp.Attr.Inode = f.inode
-	resp.Attr.Mode = os.FileMode(f.mode)
-	resp.Attr.Size = uint64(len(f.data))
 
 	return nil
 }
 
-// Flush is called when a file handle is closed. Persists encoded data to disk.
+func (f *File) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.fd != nil {
+		err := f.fd.Close()
+		f.fd = nil
+		return err
+	}
+	return nil
+}
+
 func (f *File) Flush(ctx context.Context, req *fuse.FlushRequest) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-
-	return f.persistLocked()
+	if f.fd != nil {
+		return f.fd.Sync()
+	}
+	return nil
 }
 
-// Fsync persists encoded data to disk on an explicit sync call.
 func (f *File) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-
-	return f.persistLocked()
+	if f.fd != nil {
+		return f.fd.Sync()
+	}
+	return nil
 }
 
-// persistLocked encodes f.data and writes it to upperPath.
-// Must be called with f.mu held. No-op if the file has not been modified.
-func (f *File) persistLocked() error {
-	if f.upperPath == "" || !f.dirty {
-		return nil
-	}
-	encoded, err := EncodeToDisk(f.data, f.codec)
+// Resolved Conflict 3: Keep copyAndEncodeChunked and discard persistLocked
+// copyAndEncodeChunked streams blocks directly from the lower file to the upper layer without ballooning RAM
+func copyAndEncodeChunked(srcPath, dstPath string, dstCodec FileCodec) error {
+	srcF, err := os.Open(srcPath)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(f.upperPath, encoded, os.FileMode(f.mode))
-}
+	defer srcF.Close()
 
-// copyAndEncode reads src (plaintext or encoded), decodes it, re-encodes it
-// with the given codec, and writes the result to dst. Used for CoW.
-func copyAndEncode(src, dst string, codec FileCodec) error {
-	rawData, err := os.ReadFile(src)
+	dstF, err := os.OpenFile(dstPath, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0644)
 	if err != nil {
 		return err
 	}
-	plaintext, err := DecodeFromDisk(rawData, codec)
-	if err != nil {
-		return err
+	defer dstF.Close()
+
+	header := make([]byte, 5)
+	n, _ := srcF.ReadAt(header, 0)
+
+	var srcCodec FileCodec = PlainCodec{}
+	if n == 5 && bytes.Equal(header[:4], magicPrefix) {
+		if header[4] == typeAES {
+			srcCodec = dstCodec
+		} else if header[4] == typeGzip {
+			srcCodec = GzipCodec{}
+		}
 	}
-	encoded, err := EncodeToDisk(plaintext, codec)
-	if err != nil {
-		return err
+
+	buf := make([]byte, 4096)
+	var offset int64 = 0
+	for {
+		n, err := srcCodec.ReadAt(srcF, buf, offset)
+		if n > 0 {
+			_, wErr := dstCodec.WriteAt(dstF, buf[:n], offset)
+			if wErr != nil {
+				return wErr
+			}
+			offset += int64(n)
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
 	}
-	return os.WriteFile(dst, encoded, 0644)
+	return nil
 }

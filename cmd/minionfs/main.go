@@ -46,22 +46,20 @@ func main() {
 		compress:   *compress,
 	}
 
-	// Make sure upper and lower dirs actually exist
 	for _, dir := range []string{cfg.lowerDir, cfg.upperDir} {
 		if _, err := os.Stat(dir); err != nil {
 			log.Fatalf("Directory does not exist: %s", dir)
 		}
 	}
 
-	// Build the codec based on flags (nil → PlainCodec inside FS)
 	var codec minionfs.FileCodec
 	switch {
 	case cfg.encryptKey != "":
-		codec = minionfs.NewAESCodec(cfg.encryptKey)
-		log.Println("AES-256-GCM encryption enabled")
+		codec = minionfs.NewChunkedAES(cfg.encryptKey)
+		log.Println("Chunked AES-256-GCM block encryption enabled")
 	case cfg.compress:
 		codec = minionfs.GzipCodec{}
-		log.Println("Gzip compression enabled")
+		log.Println("Gzip compression enabled (Note: stream-based, unoptimized for random access)")
 	default:
 		log.Println("No encoding — upper layer stored as plaintext")
 	}
@@ -101,12 +99,10 @@ func main() {
 		log.Println("Lazy Unmounting")
 		command := exec.Command("fusermount", "-u", "-z", cfg.mount)
 		cmd_err := command.Run()
-
 		if cmd_err != nil {
 			log.Println(cmd_err)
 			return
 		}
-
 		return
 	}
 

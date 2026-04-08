@@ -17,14 +17,11 @@ func newTestFile(t *testing.T, upper string, name string, data []byte) *File {
 	}
 	return &File{
 		inode:     nextInode(),
-		data:      append([]byte{}, data...),
 		mode:      0o644,
 		upperPath: upperPath,
-		dirty:     true, // data was just written; treat as modified
+		codec:     PlainCodec{}, // Default to plain for basic lifecycle tests
 	}
 }
-
-// ---- Attr ----
 
 func TestFile_Attr(t *testing.T) {
 	_, upper, cleanup := setupOverlay(t)
@@ -45,14 +42,16 @@ func TestFile_Attr(t *testing.T) {
 	}
 }
 
-// ---- Read ----
-
 func TestFile_Read_Full(t *testing.T) {
 	_, upper, cleanup := setupOverlay(t)
 	defer cleanup()
 
 	content := []byte("read me")
 	f := newTestFile(t, upper, "read_full.txt", content)
+
+	// FUSE Lifecycle: Open -> Read -> Release
+	f.Open(context.Background(), &fuse.OpenRequest{Flags: fuse.OpenFlags(os.O_RDONLY)}, &fuse.OpenResponse{})
+	defer f.Release(context.Background(), &fuse.ReleaseRequest{})
 
 	req := &fuse.ReadRequest{Offset: 0, Size: len(content)}
 	resp := &fuse.ReadResponse{}
@@ -72,6 +71,9 @@ func TestFile_Read_Partial(t *testing.T) {
 	content := []byte("0123456789")
 	f := newTestFile(t, upper, "read_partial.txt", content)
 
+	f.Open(context.Background(), &fuse.OpenRequest{Flags: fuse.OpenFlags(os.O_RDONLY)}, &fuse.OpenResponse{})
+	defer f.Release(context.Background(), &fuse.ReleaseRequest{})
+
 	req := &fuse.ReadRequest{Offset: 3, Size: 4}
 	resp := &fuse.ReadResponse{}
 
@@ -90,6 +92,9 @@ func TestFile_Read_PastEnd(t *testing.T) {
 	content := []byte("short")
 	f := newTestFile(t, upper, "read_past.txt", content)
 
+	f.Open(context.Background(), &fuse.OpenRequest{Flags: fuse.OpenFlags(os.O_RDONLY)}, &fuse.OpenResponse{})
+	defer f.Release(context.Background(), &fuse.ReleaseRequest{})
+
 	req := &fuse.ReadRequest{Offset: int64(len(content)) + 10, Size: 5}
 	resp := &fuse.ReadResponse{}
 
@@ -101,13 +106,14 @@ func TestFile_Read_PastEnd(t *testing.T) {
 	}
 }
 
-// ---- Write ----
-
 func TestFile_Write_OverwritesContent(t *testing.T) {
 	_, upper, cleanup := setupOverlay(t)
 	defer cleanup()
 
 	f := newTestFile(t, upper, "write_test.txt", []byte("original"))
+
+	f.Open(context.Background(), &fuse.OpenRequest{Flags: fuse.OpenFlags(os.O_RDWR)}, &fuse.OpenResponse{})
+	defer f.Release(context.Background(), &fuse.ReleaseRequest{})
 
 	req := &fuse.WriteRequest{Offset: 0, Data: []byte("replaced")}
 	resp := &fuse.WriteResponse{}
@@ -118,16 +124,22 @@ func TestFile_Write_OverwritesContent(t *testing.T) {
 	if resp.Size != len("replaced") {
 		t.Errorf("expected write size %d, got %d", len("replaced"), resp.Size)
 	}
-	if string(f.data) != "replaced" {
-		t.Errorf("in-memory data mismatch: %q", f.data)
+
+	// Verify on disk instead of memory
+	diskData, _ := os.ReadFile(f.upperPath)
+	if string(diskData) != "replaced" {
+		t.Errorf("disk data mismatch: expected %q, got %q", "replaced", diskData)
 	}
 }
 
-func TestFile_Write_AppendsGrowsBuffer(t *testing.T) {
+func TestFile_Write_AppendsGrowsFile(t *testing.T) {
 	_, upper, cleanup := setupOverlay(t)
 	defer cleanup()
 
 	f := newTestFile(t, upper, "write_grow.txt", []byte("AB"))
+
+	f.Open(context.Background(), &fuse.OpenRequest{Flags: fuse.OpenFlags(os.O_RDWR)}, &fuse.OpenResponse{})
+	defer f.Release(context.Background(), &fuse.ReleaseRequest{})
 
 	req := &fuse.WriteRequest{Offset: 2, Data: []byte("CD")}
 	resp := &fuse.WriteResponse{}
@@ -135,37 +147,10 @@ func TestFile_Write_AppendsGrowsBuffer(t *testing.T) {
 	if err := f.Write(context.Background(), req, resp); err != nil {
 		t.Fatalf("Write error: %v", err)
 	}
-	if string(f.data) != "ABCD" {
-		t.Errorf("expected %q, got %q", "ABCD", f.data)
-	}
-}
 
-func TestFile_Write_PersistsToDisk(t *testing.T) {
-	_, upper, cleanup := setupOverlay(t)
-	defer cleanup()
-
-	upperPath := filepath.Join(upper, "persist.txt")
-	f := &File{
-		inode:     nextInode(),
-		data:      []byte("old"),
-		mode:      0o644,
-		upperPath: upperPath,
-	}
-	os.WriteFile(upperPath, []byte("old"), 0o644)
-
-	req := &fuse.WriteRequest{Offset: 0, Data: []byte("new")}
-	resp := &fuse.WriteResponse{}
-
-	if err := f.Write(context.Background(), req, resp); err != nil {
-		t.Fatalf("Write error: %v", err)
-	}
-
-	diskData, err := os.ReadFile(upperPath)
-	if err != nil {
-		t.Fatalf("failed to read back file: %v", err)
-	}
-	if string(diskData) != "new" {
-		t.Errorf("disk data: expected %q, got %q", "new", diskData)
+	diskData, _ := os.ReadFile(f.upperPath)
+	if string(diskData) != "ABCD" {
+		t.Errorf("expected %q, got %q", "ABCD", diskData)
 	}
 }
 
@@ -179,13 +164,17 @@ func TestFile_Write_CopyOnWrite(t *testing.T) {
 
 	f := &File{
 		inode:     nextInode(),
-		data:      []byte("from lower"),
 		mode:      0o644,
 		upperPath: upperPath,
 		lowerPath: lowerPath,
+		codec:     PlainCodec{},
 	}
 
-	req := &fuse.WriteRequest{Offset: 0, Data: []byte("modified")}
+	// Triggering CoW dynamically upon opening for Write
+	f.Open(context.Background(), &fuse.OpenRequest{Flags: fuse.OpenFlags(os.O_RDWR)}, &fuse.OpenResponse{})
+	defer f.Release(context.Background(), &fuse.ReleaseRequest{})
+
+	req := &fuse.WriteRequest{Offset: 0, Data: []byte("modified ")}
 	resp := &fuse.WriteResponse{}
 
 	if err := f.Write(context.Background(), req, resp); err != nil {
@@ -195,9 +184,12 @@ func TestFile_Write_CopyOnWrite(t *testing.T) {
 	if _, err := os.Stat(upperPath); err != nil {
 		t.Errorf("expected upper copy to exist after CoW write: %v", err)
 	}
-}
 
-// ---- Setattr ----
+	diskData, _ := os.ReadFile(upperPath)
+	if string(diskData) != "modified r" {
+		t.Errorf("expected modified CoW file to be 'modified r', got %q", diskData)
+	}
+}
 
 func TestFile_Setattr_Mode(t *testing.T) {
 	_, upper, cleanup := setupOverlay(t)
@@ -213,6 +205,11 @@ func TestFile_Setattr_Mode(t *testing.T) {
 	if f.mode != uint32(0o755) {
 		t.Errorf("expected mode 0755, got %o", f.mode)
 	}
+
+	stat, _ := os.Stat(f.upperPath)
+	if stat.Mode().Perm() != 0o755 {
+		t.Errorf("expected physical file mode 0755, got %v", stat.Mode().Perm())
+	}
 }
 
 func TestFile_Setattr_TruncateShrink(t *testing.T) {
@@ -226,8 +223,10 @@ func TestFile_Setattr_TruncateShrink(t *testing.T) {
 	if err := f.Setattr(context.Background(), req, resp); err != nil {
 		t.Fatalf("Setattr error: %v", err)
 	}
-	if string(f.data) != "hello" {
-		t.Errorf("expected %q after truncate, got %q", "hello", f.data)
+
+	diskData, _ := os.ReadFile(f.upperPath)
+	if string(diskData) != "hello" {
+		t.Errorf("expected %q after truncate, got %q", "hello", diskData)
 	}
 }
 
@@ -242,75 +241,14 @@ func TestFile_Setattr_TruncateGrow(t *testing.T) {
 	if err := f.Setattr(context.Background(), req, resp); err != nil {
 		t.Fatalf("Setattr error: %v", err)
 	}
-	if uint64(len(f.data)) != 5 {
-		t.Errorf("expected length 5, got %d", len(f.data))
+
+	stat, _ := os.Stat(f.upperPath)
+	if stat.Size() != 5 {
+		t.Errorf("expected length 5, got %d", stat.Size())
 	}
 }
 
-// ---- Flush / Fsync ----
-
-func TestFile_Flush_PersistsToDisk(t *testing.T) {
-	_, upper, cleanup := setupOverlay(t)
-	defer cleanup()
-
-	upperPath := filepath.Join(upper, "flush.txt")
-	f := &File{
-		inode:     nextInode(),
-		data:      []byte("flushed"),
-		mode:      0o644,
-		upperPath: upperPath,
-		dirty:     true, // simulate a file that has been written to
-	}
-
-	if err := f.Flush(context.Background(), &fuse.FlushRequest{}); err != nil {
-		t.Fatalf("Flush error: %v", err)
-	}
-
-	data, err := os.ReadFile(upperPath)
-	if err != nil {
-		t.Fatalf("failed to read flushed file: %v", err)
-	}
-	if string(data) != "flushed" {
-		t.Errorf("expected %q, got %q", "flushed", data)
-	}
-}
-
-func TestFile_Flush_NoUpperPath_IsNoop(t *testing.T) {
-	f := &File{inode: nextInode(), data: []byte("x"), mode: 0o644}
-	if err := f.Flush(context.Background(), &fuse.FlushRequest{}); err != nil {
-		t.Errorf("Flush with no upperPath should not error, got: %v", err)
-	}
-}
-
-func TestFile_Fsync_PersistsToDisk(t *testing.T) {
-	_, upper, cleanup := setupOverlay(t)
-	defer cleanup()
-
-	upperPath := filepath.Join(upper, "fsync.txt")
-	f := &File{
-		inode:     nextInode(),
-		data:      []byte("synced"),
-		mode:      0o644,
-		upperPath: upperPath,
-		dirty:     true, // simulate a file that has been written to
-	}
-
-	if err := f.Fsync(context.Background(), &fuse.FsyncRequest{}); err != nil {
-		t.Fatalf("Fsync error: %v", err)
-	}
-
-	data, err := os.ReadFile(upperPath)
-	if err != nil {
-		t.Fatalf("failed to read fsynced file: %v", err)
-	}
-	if string(data) != "synced" {
-		t.Errorf("expected %q, got %q", "synced", data)
-	}
-}
-
-// ---- copyFile ----
-
-func TestCopyFile(t *testing.T) {
+func TestCopyAndEncodeChunked(t *testing.T) {
 	lower, upper, cleanup := setupOverlay(t)
 	defer cleanup()
 
@@ -318,8 +256,8 @@ func TestCopyFile(t *testing.T) {
 	dst := filepath.Join(upper, "dst.txt")
 	os.WriteFile(src, []byte("copied content"), 0o644)
 
-	if err := copyAndEncode(src, dst, PlainCodec{}); err != nil {
-		t.Fatalf("copyAndEncode error: %v", err)
+	if err := copyAndEncodeChunked(src, dst, PlainCodec{}); err != nil {
+		t.Fatalf("copyAndEncodeChunked error: %v", err)
 	}
 
 	data, err := os.ReadFile(dst)
@@ -331,120 +269,52 @@ func TestCopyFile(t *testing.T) {
 	}
 }
 
-func TestCopyFile_MissingSrc(t *testing.T) {
+func TestCopyAndEncodeChunked_MissingSrc(t *testing.T) {
 	_, upper, cleanup := setupOverlay(t)
 	defer cleanup()
 
-	if err := copyAndEncode("/nonexistent/src.txt", filepath.Join(upper, "dst.txt"), PlainCodec{}); err == nil {
+	if err := copyAndEncodeChunked("/nonexistent/src.txt", filepath.Join(upper, "dst.txt"), PlainCodec{}); err == nil {
 		t.Error("expected error copying from nonexistent src")
 	}
 }
 
-// ---- Bug 4: Flush must not write to upper for read-only (clean) opens ----
+// ---- Reimagined Bug 4 Fix Test ----
+// The original Bug 4 fix used a "dirty" flag to ensure clean files weren't flushed.
+// In the chunking architecture, the underlying fd points to the lower layer for read-only
+// access, so we naturally verify that an upper file is never created without a write.
 
-// TestFile_Flush_CleanDoesNotWriteToUpper verifies that Flush on an unmodified
-// file (dirty=false) does not copy it to the upper layer. Without the dirty
-// flag, reading a lower-layer file through the FUSE mount would silently
-// create an upper copy on every close, defeating the read-only lower layer.
-func TestFile_Flush_CleanDoesNotWriteToUpper(t *testing.T) {
-	_, upper, cleanup := setupOverlay(t)
+func TestFile_CleanDoesNotWriteToUpper(t *testing.T) {
+	lower, upper, cleanup := setupOverlay(t)
 	defer cleanup()
 
+	lowerPath := filepath.Join(lower, "readonly.txt")
 	upperPath := filepath.Join(upper, "readonly.txt")
+	os.WriteFile(lowerPath, []byte("loaded from lower"), 0o644)
+
 	f := &File{
 		inode:     nextInode(),
-		data:      []byte("loaded from lower"),
 		mode:      0o644,
 		upperPath: upperPath,
-		// dirty intentionally left false — simulates Lookup without any Write
+		lowerPath: lowerPath,
+		codec:     PlainCodec{},
 	}
 
+	// Open read-only (should resolve fd to lower layer)
+	f.Open(context.Background(), &fuse.OpenRequest{Flags: fuse.OpenFlags(os.O_RDONLY)}, &fuse.OpenResponse{})
+	
+	// Simulate Flush/Fsync calls
 	if err := f.Flush(context.Background(), &fuse.FlushRequest{}); err != nil {
 		t.Fatalf("Flush error: %v", err)
 	}
-
-	if _, err := os.Stat(upperPath); !os.IsNotExist(err) {
-		t.Error("Flush on a clean file must not create an upper-layer copy")
-	}
-}
-
-// TestFile_Fsync_CleanDoesNotWriteToUpper is the Fsync equivalent of the above.
-func TestFile_Fsync_CleanDoesNotWriteToUpper(t *testing.T) {
-	_, upper, cleanup := setupOverlay(t)
-	defer cleanup()
-
-	upperPath := filepath.Join(upper, "readonly_fsync.txt")
-	f := &File{
-		inode:     nextInode(),
-		data:      []byte("loaded from lower"),
-		mode:      0o644,
-		upperPath: upperPath,
-	}
-
 	if err := f.Fsync(context.Background(), &fuse.FsyncRequest{}); err != nil {
 		t.Fatalf("Fsync error: %v", err)
 	}
 
+	// Close
+	f.Release(context.Background(), &fuse.ReleaseRequest{})
+
+	// Validate upper file was never created
 	if _, err := os.Stat(upperPath); !os.IsNotExist(err) {
-		t.Error("Fsync on a clean file must not create an upper-layer copy")
-	}
-}
-
-// TestFile_Write_SetsDirty confirms that Write marks the file dirty so a
-// subsequent Flush will actually persist the data.
-func TestFile_Write_SetsDirty(t *testing.T) {
-	_, upper, cleanup := setupOverlay(t)
-	defer cleanup()
-
-	upperPath := filepath.Join(upper, "dirty_test.txt")
-	os.WriteFile(upperPath, []byte("old"), 0o644)
-
-	f := &File{
-		inode:     nextInode(),
-		data:      []byte("old"),
-		mode:      0o644,
-		upperPath: upperPath,
-	}
-
-	req := &fuse.WriteRequest{Offset: 0, Data: []byte("new")}
-	if err := f.Write(context.Background(), req, &fuse.WriteResponse{}); err != nil {
-		t.Fatalf("Write error: %v", err)
-	}
-	if !f.dirty {
-		t.Error("Write must set dirty=true")
-	}
-}
-
-// TestFile_Setattr_SetsDirtyOnMode confirms that a mode change marks the file dirty.
-func TestFile_Setattr_SetsDirtyOnMode(t *testing.T) {
-	_, upper, cleanup := setupOverlay(t)
-	defer cleanup()
-
-	f := newTestFile(t, upper, "setattr_dirty_mode.txt", []byte("x"))
-	f.dirty = false // reset — newTestFile sets dirty=true via Write
-
-	req := &fuse.SetattrRequest{Valid: fuse.SetattrMode, Mode: 0o755}
-	if err := f.Setattr(context.Background(), req, &fuse.SetattrResponse{}); err != nil {
-		t.Fatalf("Setattr error: %v", err)
-	}
-	if !f.dirty {
-		t.Error("Setattr(mode) must set dirty=true")
-	}
-}
-
-// TestFile_Setattr_SetsDirtyOnSize confirms that a truncation marks the file dirty.
-func TestFile_Setattr_SetsDirtyOnSize(t *testing.T) {
-	_, upper, cleanup := setupOverlay(t)
-	defer cleanup()
-
-	f := newTestFile(t, upper, "setattr_dirty_size.txt", []byte("hello"))
-	f.dirty = false
-
-	req := &fuse.SetattrRequest{Valid: fuse.SetattrSize, Size: 2}
-	if err := f.Setattr(context.Background(), req, &fuse.SetattrResponse{}); err != nil {
-		t.Fatalf("Setattr error: %v", err)
-	}
-	if !f.dirty {
-		t.Error("Setattr(size) must set dirty=true")
+		t.Error("Read-only lifecycle on a clean file must not create an upper-layer copy")
 	}
 }
