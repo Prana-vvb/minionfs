@@ -97,6 +97,13 @@ func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 			lowerSub = ""
 		}
 
+		// Ensure the upper subdir exists so that CoW writes and Flush don't fail
+		if _, err := os.Lstat(upperSub); os.IsNotExist(err) {
+			if mkErr := os.MkdirAll(upperSub, 0o755); mkErr != nil {
+				return nil, syscall.EIO
+			}
+		}
+
 		return &Dir{
 			inode:    nextInode(),
 			upperDir: upperSub,
