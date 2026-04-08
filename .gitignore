@@ -6,6 +6,8 @@ main
 # Mountpoints
 mnt/
 test/
+lower/
+upper/
 
 **/.DS_Store
 
