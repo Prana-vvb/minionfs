@@ -42,11 +42,12 @@ func (f *FS) Root() (fs.Node, error) {
 type File struct {
 	mu        sync.Mutex
 	inode     uint64
-	data      []byte   // always plaintext in memory
+	data      []byte    // always plaintext in memory
 	mode      uint32
-	upperPath string   // where this file lives (or should live) in the upper layer
-	lowerPath string   // where this file lives in the lower layer (empty if upper-only)
+	upperPath string    // where this file lives (or should live) in the upper layer
+	lowerPath string    // where this file lives in the lower layer (empty if upper-only)
 	codec     FileCodec
+	dirty     bool      // true once Write or Setattr has modified f.data / f.mode
 }
 
 type Dir struct {
