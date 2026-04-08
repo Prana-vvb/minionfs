@@ -488,7 +488,7 @@ func TestFile_CleanDoesNotWriteToUpper(t *testing.T) {
 
 	// Open read-only (should resolve fd to lower layer)
 	f.Open(context.Background(), &fuse.OpenRequest{Flags: fuse.OpenFlags(os.O_RDONLY)}, &fuse.OpenResponse{})
-	
+
 	// Simulate Flush/Fsync calls
 	if err := f.Flush(context.Background(), &fuse.FlushRequest{}); err != nil {
 		t.Fatalf("Flush error: %v", err)

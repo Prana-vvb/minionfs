@@ -155,7 +155,7 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 	if err != nil {
 		return err
 	}
-	
+
 	resp.Size = n
 	return nil
 }
@@ -247,9 +247,10 @@ func copyAndEncodeChunked(srcPath, dstPath string, dstCodec FileCodec) error {
 
 	var srcCodec FileCodec = PlainCodec{}
 	if n == 5 && bytes.Equal(header[:4], magicPrefix) {
-		if header[4] == typeAES {
+		switch header[4] {
+		case typeAES:
 			srcCodec = dstCodec
-		} else if header[4] == typeGzip {
+		case typeGzip:
 			srcCodec = GzipCodec{}
 		}
 	}

@@ -152,7 +152,6 @@ func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 
 	seen := make(map[string]fuse.DirentType)
 
-
 	// Read upper layer — skip whiteout marker files themselves using the
 	// shared isWhiteoutEntry helper (avoids duplicating the prefix logic).
 	if entries, err := os.ReadDir(d.upperDir); err == nil {
@@ -268,11 +267,10 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 
 	upperPath := filepath.Join(d.upperDir, req.Name)
 
-	osFile, err := os.OpenFile(upperPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, req.Mode)
+	osFile, err := os.OpenFile(upperPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, req.Mode)
 	if err != nil {
 		return nil, nil, syscall.EIO
 	}
-	osFile.Close()
 
 	if err := removeWhiteout(d.upperDir, req.Name); err != nil {
 		d.fs.DebugPrint("CREATE", "warning: could not remove stale whiteout for", req.Name)
@@ -283,6 +281,7 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 		mode:      uint32(req.Mode),
 		upperPath: upperPath,
 		codec:     d.fs.getCodec(),
+		fd:        osFile,
 	}
 
 	return f, f, nil
