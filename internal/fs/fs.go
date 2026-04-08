@@ -46,7 +46,7 @@ type File struct {
 	upperPath string
 	lowerPath string
 	codec     FileCodec
-	fd        *os.File // Open handle used for zero-memory stream processing
+	fd        *os.File
 }
 
 type Dir struct {

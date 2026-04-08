@@ -36,6 +36,22 @@ func TestIsWhiteout_Absent(t *testing.T) {
 	}
 }
 
+// ---- isWhiteoutEntry ----
+
+func TestIsWhiteoutEntry_True(t *testing.T) {
+	if !isWhiteoutEntry(".wh.somefile.txt") {
+		t.Error("expected isWhiteoutEntry to return true for .wh. prefixed name")
+	}
+}
+
+func TestIsWhiteoutEntry_False(t *testing.T) {
+	for _, name := range []string{"regular.txt", ".wh.", "wh.nope"} {
+		if isWhiteoutEntry(name) {
+			t.Errorf("isWhiteoutEntry(%q) should be false", name)
+		}
+	}
+}
+
 // ---- createWhiteout ----
 
 func TestCreateWhiteout(t *testing.T) {
@@ -49,6 +65,36 @@ func TestCreateWhiteout(t *testing.T) {
 
 	if !isWhiteout(upper, name) {
 		t.Error("whiteout file not found after createWhiteout")
+	}
+}
+
+// ---- removeWhiteout ----
+
+func TestRemoveWhiteout_RemovesExisting(t *testing.T) {
+	_, upper, cleanup := setupOverlay(t)
+	defer cleanup()
+
+	name := "gone.txt"
+	if err := createWhiteout(upper, name); err != nil {
+		t.Fatalf("setup: createWhiteout failed: %v", err)
+	}
+
+	if err := removeWhiteout(upper, name); err != nil {
+		t.Fatalf("removeWhiteout failed: %v", err)
+	}
+
+	if isWhiteout(upper, name) {
+		t.Error("whiteout should be gone after removeWhiteout")
+	}
+}
+
+func TestRemoveWhiteout_NoopWhenAbsent(t *testing.T) {
+	_, upper, cleanup := setupOverlay(t)
+	defer cleanup()
+
+	// Must not error when there is nothing to remove.
+	if err := removeWhiteout(upper, "never_existed.txt"); err != nil {
+		t.Errorf("removeWhiteout on absent marker should not error, got: %v", err)
 	}
 }
 
@@ -260,7 +306,7 @@ func TestReadDirAll_DoesNotExposeWhiteoutMarkers(t *testing.T) {
 	}
 
 	for _, e := range entries {
-		if len(e.Name) >= len(whiteoutPrefix) && e.Name[:len(whiteoutPrefix)] == whiteoutPrefix {
+		if isWhiteoutEntry(e.Name) {
 			t.Errorf("whiteout marker %q should not appear in listing", e.Name)
 		}
 	}
@@ -303,6 +349,45 @@ func TestMkdir_DuplicateReturnsEEXIST(t *testing.T) {
 	}
 }
 
+// Bug 5: Mkdir must remove a stale whiteout for the same name so that the
+// newly created directory is visible after remount.
+func TestMkdir_ClearsStaleWhiteout(t *testing.T) {
+	lower, upper, cleanup := setupOverlay(t)
+	defer cleanup()
+
+	name := "reborn"
+	// Simulate: directory was previously deleted, leaving a whiteout.
+	if err := createWhiteout(upper, name); err != nil {
+		t.Fatalf("setup: createWhiteout: %v", err)
+	}
+
+	d := rootDir(lower, upper)
+	req := &fuse.MkdirRequest{Name: name, Mode: os.ModeDir | 0o755}
+	if _, err := d.Mkdir(context.Background(), req); err != nil {
+		t.Fatalf("Mkdir error: %v", err)
+	}
+
+	// Whiteout must be gone — the new directory must be visible.
+	if isWhiteout(upper, name) {
+		t.Error("stale whiteout should have been removed by Mkdir")
+	}
+
+	// Directory must be visible in a fresh ReadDirAll.
+	entries, err := d.ReadDirAll(context.Background())
+	if err != nil {
+		t.Fatalf("ReadDirAll error: %v", err)
+	}
+	found := false
+	for _, e := range entries {
+		if e.Name == name {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("recreated directory %q should be visible in listing", name)
+	}
+}
+
 // ---- Create ----
 
 func TestCreate_NewFileInUpper(t *testing.T) {
@@ -323,6 +408,47 @@ func TestCreate_NewFileInUpper(t *testing.T) {
 
 	if _, err := os.Stat(filepath.Join(upper, "created.txt")); err != nil {
 		t.Errorf("created file not found in upper: %v", err)
+	}
+}
+
+// Bug 6: Create must remove a stale whiteout for the same name so that the
+// newly created file is visible after remount.
+func TestCreate_ClearsStaleWhiteout(t *testing.T) {
+	lower, upper, cleanup := setupOverlay(t)
+	defer cleanup()
+
+	name := "zombie.txt"
+	// Simulate: file was previously deleted from lower, leaving a whiteout.
+	os.WriteFile(filepath.Join(lower, name), []byte("original"), 0o644)
+	if err := createWhiteout(upper, name); err != nil {
+		t.Fatalf("setup: createWhiteout: %v", err)
+	}
+
+	d := rootDir(lower, upper)
+	req := &fuse.CreateRequest{Name: name, Mode: 0o644}
+	resp := &fuse.CreateResponse{}
+	if _, _, err := d.Create(context.Background(), req, resp); err != nil {
+		t.Fatalf("Create error: %v", err)
+	}
+
+	// Whiteout must be gone.
+	if isWhiteout(upper, name) {
+		t.Error("stale whiteout should have been removed by Create")
+	}
+
+	// File must be visible in a fresh ReadDirAll.
+	entries, err := d.ReadDirAll(context.Background())
+	if err != nil {
+		t.Fatalf("ReadDirAll error: %v", err)
+	}
+	found := false
+	for _, e := range entries {
+		if e.Name == name {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("recreated file %q should be visible in listing", name)
 	}
 }
 
@@ -405,21 +531,138 @@ func TestRemove_NotFound_ReturnsENOENT(t *testing.T) {
 	}
 }
 
-func TestRemove_Directory(t *testing.T) {
+// Bug fix: rmdir on a non-empty directory must return ENOTEMPTY.
+// The old code used os.RemoveAll which silently nuked the directory.
+func TestRemove_NonEmptyDirectory_ReturnsENOTEMPTY(t *testing.T) {
 	lower, upper, cleanup := setupOverlay(t)
 	defer cleanup()
 
-	name := "mydir"
+	name := "notempty"
+	os.MkdirAll(filepath.Join(upper, name), 0o755)
+	// Put a file inside so the directory is non-empty.
+	os.WriteFile(filepath.Join(upper, name, "child.txt"), []byte("x"), 0o644)
+
+	d := rootDir(lower, upper)
+	req := &fuse.RemoveRequest{Name: name, Dir: true}
+
+	err := d.Remove(context.Background(), req)
+	if err != syscall.ENOTEMPTY {
+		t.Errorf("expected ENOTEMPTY for non-empty dir, got %v", err)
+	}
+
+	// Directory must still exist — nothing was deleted.
+	if _, statErr := os.Stat(filepath.Join(upper, name)); statErr != nil {
+		t.Error("non-empty directory should still exist after failed rmdir")
+	}
+}
+
+// Bug fix: rmdir on an empty directory must succeed.
+func TestRemove_EmptyDirectory_Succeeds(t *testing.T) {
+	lower, upper, cleanup := setupOverlay(t)
+	defer cleanup()
+
+	name := "emptydir"
 	os.MkdirAll(filepath.Join(upper, name), 0o755)
 
 	d := rootDir(lower, upper)
 	req := &fuse.RemoveRequest{Name: name, Dir: true}
 
 	if err := d.Remove(context.Background(), req); err != nil {
-		t.Fatalf("Remove dir error: %v", err)
+		t.Fatalf("Remove on empty dir error: %v", err)
 	}
 
 	if _, err := os.Stat(filepath.Join(upper, name)); !os.IsNotExist(err) {
 		t.Error("directory should be removed from upper")
+	}
+}
+
+// Bug 3: removing a directory that exists only in the lower layer must
+// create a whiteout so the directory stays hidden after remount.
+func TestRemove_LowerOnlyDirectory_CreatesWhiteout(t *testing.T) {
+	lower, upper, cleanup := setupOverlay(t)
+	defer cleanup()
+
+	name := "lowerdir"
+	os.MkdirAll(filepath.Join(lower, name), 0o755)
+
+	d := rootDir(lower, upper)
+	req := &fuse.RemoveRequest{Name: name, Dir: true}
+
+	if err := d.Remove(context.Background(), req); err != nil {
+		t.Fatalf("Remove of lower-only dir error: %v", err)
+	}
+
+	if !isWhiteout(upper, name) {
+		t.Error("expected whiteout to be created for lower-only directory")
+	}
+
+	// Directory must be hidden in the merged view.
+	entries, err := d.ReadDirAll(context.Background())
+	if err != nil {
+		t.Fatalf("ReadDirAll error: %v", err)
+	}
+	for _, e := range entries {
+		if e.Name == name {
+			t.Errorf("removed lower-only dir %q should not appear in listing", name)
+		}
+	}
+}
+
+// ---- Bug 7: Mkdir must not set lowerDir to a non-existent path ----
+
+// TestMkdir_LowerDirEmptyWhenNoLowerSubdir verifies that a newly created
+// directory gets an empty lowerDir when no matching subdirectory exists in
+// the lower layer. Previously Mkdir set lowerDir unconditionally, which
+// caused resolvePath inside the new Dir to produce incorrect lower paths.
+func TestMkdir_LowerDirEmptyWhenNoLowerSubdir(t *testing.T) {
+	lower, upper, cleanup := setupOverlay(t)
+	defer cleanup()
+
+	d := rootDir(lower, upper)
+	req := &fuse.MkdirRequest{Name: "brand_new", Mode: os.ModeDir | 0o755}
+
+	node, err := d.Mkdir(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Mkdir error: %v", err)
+	}
+
+	newDir, ok := node.(*Dir)
+	if !ok {
+		t.Fatalf("expected *Dir, got %T", node)
+	}
+
+	if newDir.lowerDir != "" {
+		t.Errorf("lowerDir should be empty when lower subdir doesn't exist, got %q", newDir.lowerDir)
+	}
+}
+
+// TestMkdir_LowerDirSetWhenLowerSubdirExists verifies that when a matching
+// subdirectory already exists in the lower layer, Mkdir correctly sets lowerDir
+// so that the merged view can see lower-layer contents inside the new dir.
+func TestMkdir_LowerDirSetWhenLowerSubdirExists(t *testing.T) {
+	lower, upper, cleanup := setupOverlay(t)
+	defer cleanup()
+
+	name := "shared_subdir"
+	lowerSub := filepath.Join(lower, name)
+	if err := os.MkdirAll(lowerSub, 0o755); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	d := rootDir(lower, upper)
+	req := &fuse.MkdirRequest{Name: name, Mode: os.ModeDir | 0o755}
+
+	node, err := d.Mkdir(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Mkdir error: %v", err)
+	}
+
+	newDir, ok := node.(*Dir)
+	if !ok {
+		t.Fatalf("expected *Dir, got %T", node)
+	}
+
+	if newDir.lowerDir != lowerSub {
+		t.Errorf("lowerDir should be %q, got %q", lowerSub, newDir.lowerDir)
 	}
 }

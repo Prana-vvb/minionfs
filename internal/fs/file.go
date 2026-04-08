@@ -150,10 +150,12 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 		f.fd = file
 	}
 
+	// Resolved Conflict 1: Use chunking's WriteAt directly to disk. Discard in-memory f.data logic.
 	n, err := f.codec.WriteAt(f.fd, req.Data, req.Offset)
 	if err != nil {
 		return err
 	}
+	
 	resp.Size = n
 	return nil
 }
@@ -164,6 +166,7 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 
 	if req.Valid.Mode() {
 		f.mode = uint32(req.Mode)
+		// Resolved Conflict 2: Keep the proactive chmod to the underlying file
 		if f.fd != nil {
 			f.fd.Chmod(os.FileMode(f.mode))
 		} else if f.upperPath != "" {
@@ -189,6 +192,7 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 				return err
 			}
 		}
+		// Note: f.dirty removed here too, as chunking invalidates the need for it.
 	}
 
 	return nil
@@ -223,6 +227,7 @@ func (f *File) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
 	return nil
 }
 
+// Resolved Conflict 3: Keep copyAndEncodeChunked and discard persistLocked
 // copyAndEncodeChunked streams blocks directly from the lower file to the upper layer without ballooning RAM
 func copyAndEncodeChunked(srcPath, dstPath string, dstCodec FileCodec) error {
 	srcF, err := os.Open(srcPath)

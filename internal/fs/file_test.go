@@ -277,3 +277,44 @@ func TestCopyAndEncodeChunked_MissingSrc(t *testing.T) {
 		t.Error("expected error copying from nonexistent src")
 	}
 }
+
+// ---- Reimagined Bug 4 Fix Test ----
+// The original Bug 4 fix used a "dirty" flag to ensure clean files weren't flushed.
+// In the chunking architecture, the underlying fd points to the lower layer for read-only
+// access, so we naturally verify that an upper file is never created without a write.
+
+func TestFile_CleanDoesNotWriteToUpper(t *testing.T) {
+	lower, upper, cleanup := setupOverlay(t)
+	defer cleanup()
+
+	lowerPath := filepath.Join(lower, "readonly.txt")
+	upperPath := filepath.Join(upper, "readonly.txt")
+	os.WriteFile(lowerPath, []byte("loaded from lower"), 0o644)
+
+	f := &File{
+		inode:     nextInode(),
+		mode:      0o644,
+		upperPath: upperPath,
+		lowerPath: lowerPath,
+		codec:     PlainCodec{},
+	}
+
+	// Open read-only (should resolve fd to lower layer)
+	f.Open(context.Background(), &fuse.OpenRequest{Flags: fuse.OpenFlags(os.O_RDONLY)}, &fuse.OpenResponse{})
+	
+	// Simulate Flush/Fsync calls
+	if err := f.Flush(context.Background(), &fuse.FlushRequest{}); err != nil {
+		t.Fatalf("Flush error: %v", err)
+	}
+	if err := f.Fsync(context.Background(), &fuse.FsyncRequest{}); err != nil {
+		t.Fatalf("Fsync error: %v", err)
+	}
+
+	// Close
+	f.Release(context.Background(), &fuse.ReleaseRequest{})
+
+	// Validate upper file was never created
+	if _, err := os.Stat(upperPath); !os.IsNotExist(err) {
+		t.Error("Read-only lifecycle on a clean file must not create an upper-layer copy")
+	}
+}
