@@ -21,14 +21,22 @@ func (f *FS) DebugPrint(msg string, v ...any) {
 	}
 }
 
+// isWhiteout reports whether a whiteout marker exists in upperDir for name.
 func isWhiteout(upperDir, name string) bool {
 	whiteoutPath := filepath.Join(upperDir, whiteoutPrefix+name)
 	_, err := os.Lstat(whiteoutPath)
 	return err == nil
 }
 
-// createWhiteout creates a whiteout marker file in the upper layer to hide
-// a file that exists only in the lower layer.
+// isWhiteoutEntry reports whether a directory entry name is itself a whiteout
+// marker file (i.e. starts with the whiteout prefix). Used in ReadDirAll to
+// avoid duplicating the prefix check inline.
+func isWhiteoutEntry(name string) bool {
+	return len(name) > len(whiteoutPrefix) && name[:len(whiteoutPrefix)] == whiteoutPrefix
+}
+
+// createWhiteout creates a zero-byte whiteout marker file in the upper layer
+// to hide a file/directory that exists only in the lower layer.
 func createWhiteout(upperDir, name string) error {
 	whiteoutPath := filepath.Join(upperDir, whiteoutPrefix+name)
 	f, err := os.Create(whiteoutPath)
@@ -36,6 +44,18 @@ func createWhiteout(upperDir, name string) error {
 		return err
 	}
 	return f.Close()
+}
+
+// removeWhiteout deletes a whiteout marker for name from upperDir, if one
+// exists. Called when a file or directory is being recreated after deletion
+// so that the new entry is no longer hidden.
+func removeWhiteout(upperDir, name string) error {
+	whiteoutPath := filepath.Join(upperDir, whiteoutPrefix+name)
+	err := os.Remove(whiteoutPath)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 func (d *Dir) resolvePath(name string) (fullPath string, layer string, err error) {
@@ -141,11 +161,12 @@ func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 
 	seen := make(map[string]fuse.DirentType)
 
-	// Read upper layer.
+
+	// Read upper layer — skip whiteout marker files themselves using the
+	// shared isWhiteoutEntry helper (avoids duplicating the prefix logic).
 	if entries, err := os.ReadDir(d.upperDir); err == nil {
 		for _, e := range entries {
-			// Don't expose whiteout marker files in the merged view.
-			if strings.HasPrefix(e.Name(), whiteoutPrefix) {
+			if isWhiteoutEntry(e.Name()) {
 				continue
 			}
 			if e.IsDir() {
@@ -213,6 +234,13 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 		return nil, syscall.EIO
 	}
 
+	if err := removeWhiteout(d.upperDir, req.Name); err != nil {
+		// Non-fatal: log and continue — the new dir exists in upper and takes
+		// precedence over any lower entry anyway; the stale whiteout only
+		// matters across remounts.
+		d.fs.DebugPrint("MKDIR", "warning: could not remove stale whiteout for", req.Name)
+	}
+
 	newDir := &Dir{
 		inode:    nextInode(),
 		upperDir: newUpperPath,
@@ -244,6 +272,10 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 		return nil, nil, syscall.EIO
 	}
 	osFile.Close()
+
+	if err := removeWhiteout(d.upperDir, req.Name); err != nil {
+		d.fs.DebugPrint("CREATE", "warning: could not remove stale whiteout for", req.Name)
+	}
 
 	f := &File{
 		inode:     nextInode(),
@@ -295,21 +327,20 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 		return syscall.ENOENT
 	}
 
-	// Remove the upper copy if it exists (file or directory).
+	// Remove the upper copy if it exists.
 	if inUpper {
-		var removeErr error
-		if req.Dir {
-			removeErr = os.RemoveAll(upperPath)
-		} else {
-			removeErr = os.Remove(upperPath)
-		}
-		if removeErr != nil {
+		if err := os.Remove(upperPath); err != nil {
+			// Translate the OS error to the appropriate errno. On Linux,
+			// removing a non-empty directory returns syscall.ENOTEMPTY.
+			if isNotEmpty(err) {
+				return syscall.ENOTEMPTY
+			}
 			return syscall.EIO
 		}
 	}
 
 	// If the entry also existed in the lower layer, create a whiteout so it
-	// stays hidden in the merged view.
+	// stays hidden in the merged view — for both files and directories.
 	if inLower {
 		if err := createWhiteout(d.upperDir, req.Name); err != nil {
 			return syscall.EIO
@@ -318,4 +349,16 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 	}
 
 	return nil
+}
+
+// isNotEmpty reports whether err corresponds to an ENOTEMPTY errno, handling
+// the *os.PathError wrapper that os.Remove returns.
+func isNotEmpty(err error) bool {
+	if err == syscall.ENOTEMPTY {
+		return true
+	}
+	if pe, ok := err.(*os.PathError); ok {
+		return pe.Err == syscall.ENOTEMPTY
+	}
+	return false
 }
