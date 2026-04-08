@@ -315,8 +315,8 @@ func TestCopyFile(t *testing.T) {
 	dst := filepath.Join(upper, "dst.txt")
 	os.WriteFile(src, []byte("copied content"), 0o644)
 
-	if err := copyFile(src, dst); err != nil {
-		t.Fatalf("copyFile error: %v", err)
+	if err := copyAndEncode(src, dst, PlainCodec{}); err != nil {
+		t.Fatalf("copyAndEncode error: %v", err)
 	}
 
 	data, err := os.ReadFile(dst)
@@ -332,7 +332,7 @@ func TestCopyFile_MissingSrc(t *testing.T) {
 	_, upper, cleanup := setupOverlay(t)
 	defer cleanup()
 
-	if err := copyFile("/nonexistent/src.txt", filepath.Join(upper, "dst.txt")); err == nil {
+	if err := copyAndEncode("/nonexistent/src.txt", filepath.Join(upper, "dst.txt"), PlainCodec{}); err == nil {
 		t.Error("expected error copying from nonexistent src")
 	}
 }

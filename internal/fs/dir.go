@@ -97,6 +97,13 @@ func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 			lowerSub = ""
 		}
 
+		// Ensure the upper subdir exists so that CoW writes and Flush don't fail
+		if _, err := os.Lstat(upperSub); os.IsNotExist(err) {
+			if mkErr := os.MkdirAll(upperSub, 0o755); mkErr != nil {
+				return nil, syscall.EIO
+			}
+		}
+
 		return &Dir{
 			inode:    nextInode(),
 			upperDir: upperSub,
@@ -105,17 +112,22 @@ func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 		}, nil
 	}
 
-	data, err := os.ReadFile(fullPath)
+	rawData, err := os.ReadFile(fullPath)
+	if err != nil {
+		return nil, syscall.EIO
+	}
+	plaintext, err := DecodeFromDisk(rawData, d.fs.getCodec())
 	if err != nil {
 		return nil, syscall.EIO
 	}
 
 	return &File{
 		inode:     nextInode(),
-		data:      data,
+		data:      plaintext,
 		mode:      uint32(info.Mode()),
 		upperPath: filepath.Join(d.upperDir, name),
 		lowerPath: filepath.Join(d.lowerDir, name),
+		codec:     d.fs.getCodec(),
 	}, nil
 }
 
@@ -230,6 +242,7 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 		data:      []byte{},
 		mode:      uint32(req.Mode),
 		upperPath: upperPath,
+		codec:     d.fs.getCodec(),
 	}
 
 	return f, f, nil
