@@ -14,26 +14,36 @@ import (
 )
 
 type config struct {
-	debug    bool
-	lowerDir string
-	upperDir string
-	mount    string
+	debug      bool
+	lowerDir   string
+	upperDir   string
+	mount      string
+	encryptKey string
+	compress   bool
 }
 
 func main() {
 	debug := flag.Bool("d", false, "Enable debug mode")
+	encryptKey := flag.String("encrypt-key", "", "AES-256-GCM encryption passphrase for the upper layer")
+	compress := flag.Bool("compress", false, "Enable gzip compression for the upper layer")
 	flag.Parse()
 
+	if *encryptKey != "" && *compress {
+		log.Fatal("--encrypt-key and --compress are mutually exclusive")
+	}
+
 	if flag.NArg() < 3 {
-		fmt.Println("usage: minionfs [-d] <lowerdir> <upperdir> <mountpoint>")
+		fmt.Println("usage: minionfs [-d] [--encrypt-key=<key>] [--compress] <lowerdir> <upperdir> <mountpoint>")
 		return
 	}
 
 	cfg := &config{
-		debug:    *debug,
-		lowerDir: flag.Arg(0),
-		upperDir: flag.Arg(1),
-		mount:    flag.Arg(2),
+		debug:      *debug,
+		lowerDir:   flag.Arg(0),
+		upperDir:   flag.Arg(1),
+		mount:      flag.Arg(2),
+		encryptKey: *encryptKey,
+		compress:   *compress,
 	}
 
 	// Make sure upper and lower dirs actually exist
@@ -41,6 +51,19 @@ func main() {
 		if _, err := os.Stat(dir); err != nil {
 			log.Fatalf("Directory does not exist: %s", dir)
 		}
+	}
+
+	// Build the codec based on flags (nil → PlainCodec inside FS)
+	var codec minionfs.FileCodec
+	switch {
+	case cfg.encryptKey != "":
+		codec = minionfs.NewAESCodec(cfg.encryptKey)
+		log.Println("AES-256-GCM encryption enabled")
+	case cfg.compress:
+		codec = minionfs.GzipCodec{}
+		log.Println("Gzip compression enabled")
+	default:
+		log.Println("No encoding — upper layer stored as plaintext")
 	}
 
 	if cfg.debug {
@@ -63,6 +86,7 @@ func main() {
 			Debug:    cfg.debug,
 			UpperDir: cfg.upperDir,
 			LowerDir: cfg.lowerDir,
+			Codec:    codec,
 		})
 	}()
 

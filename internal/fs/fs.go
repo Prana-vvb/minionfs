@@ -11,6 +11,15 @@ type FS struct {
 	Debug    bool
 	UpperDir string
 	LowerDir string
+	Codec    FileCodec // nil means PlainCodec (no encoding)
+}
+
+// getCodec returns the configured codec, defaulting to PlainCodec.
+func (f *FS) getCodec() FileCodec {
+	if f.Codec == nil {
+		return PlainCodec{}
+	}
+	return f.Codec
 }
 
 var inodeCounter uint64 = 2
@@ -33,10 +42,11 @@ func (f *FS) Root() (fs.Node, error) {
 type File struct {
 	mu        sync.Mutex
 	inode     uint64
-	data      []byte
+	data      []byte   // always plaintext in memory
 	mode      uint32
-	upperPath string
-	lowerPath string
+	upperPath string   // where this file lives (or should live) in the upper layer
+	lowerPath string   // where this file lives in the lower layer (empty if upper-only)
+	codec     FileCodec
 }
 
 type Dir struct {

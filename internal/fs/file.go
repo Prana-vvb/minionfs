@@ -2,7 +2,6 @@ package fs
 
 import (
 	"context"
-	"io"
 	"os"
 	"syscall"
 
@@ -15,7 +14,7 @@ func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 	defer f.mu.Unlock()
 	a.Inode = f.inode
 	a.Mode = os.FileMode(f.mode)
-	a.Size = uint64(len(f.data))
+	a.Size = uint64(len(f.data)) // plaintext size — what the OS sees
 
 	return nil
 }
@@ -30,7 +29,6 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadR
 
 	if req.Offset >= int64(len(f.data)) {
 		resp.Data = []byte{}
-
 		return nil
 	}
 
@@ -41,25 +39,25 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadR
 	return nil
 }
 
-// Write writes data to the file, performing Copy-on-Write if the file
-// exists only in the lower layer.
+// Write updates the in-memory buffer and immediately persists the encoded
+// result to the upper layer. If the file exists only in the lower layer,
+// Copy-on-Write is triggered first: the lower file is encoded and copied
+// to the upper layer before the write proceeds.
 func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	// Copy-on-Write: if the file doesn't exist in the upper layer yet,
-	// copy it from the lower layer before modifying.
+	// Copy-on-Write: upper file doesn't exist yet → copy lower → upper (encoded).
 	if f.upperPath != "" {
 		if _, err := os.Lstat(f.upperPath); os.IsNotExist(err) {
-			if err := copyFile(f.lowerPath, f.upperPath); err != nil {
+			if err := copyAndEncode(f.lowerPath, f.upperPath, f.codec); err != nil {
 				return syscall.EIO
 			}
 		}
 	}
 
+	// Grow the buffer if the write extends beyond the current size.
 	end := req.Offset + int64(len(req.Data))
-
-	// Grow the buffer if needed
 	if end > int64(len(f.data)) {
 		newData := make([]byte, end)
 		copy(newData, f.data)
@@ -69,11 +67,9 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 	copy(f.data[req.Offset:], req.Data)
 	resp.Size = len(req.Data)
 
-	// Persist to disk immediately after every write
-	if f.upperPath != "" {
-		if err := os.WriteFile(f.upperPath, f.data, os.FileMode(f.mode)); err != nil {
-			return syscall.EIO
-		}
+	// Persist encoded data to the upper layer immediately.
+	if err := f.persistLocked(); err != nil {
+		return syscall.EIO
 	}
 
 	return nil
@@ -105,44 +101,49 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 	return nil
 }
 
-// Flush is called when a file handle is closed. Persists in-memory data to disk.
+// Flush is called when a file handle is closed. Persists encoded data to disk.
 func (f *File) Flush(ctx context.Context, req *fuse.FlushRequest) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	if f.upperPath == "" {
-		return nil
-	}
-
-	return os.WriteFile(f.upperPath, f.data, os.FileMode(f.mode))
+	return f.persistLocked()
 }
 
-// Fsync persists in-memory data to disk on explicit sync.
+// Fsync persists encoded data to disk on an explicit sync call.
 func (f *File) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	return f.persistLocked()
+}
+
+// persistLocked encodes f.data and writes it to upperPath.
+// Must be called with f.mu held.
+func (f *File) persistLocked() error {
 	if f.upperPath == "" {
 		return nil
 	}
-
-	return os.WriteFile(f.upperPath, f.data, os.FileMode(f.mode))
+	encoded, err := EncodeToDisk(f.data, f.codec)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(f.upperPath, encoded, os.FileMode(f.mode))
 }
 
-// copyFile copies src to dst, creating dst if it doesn't exist.
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
+// copyAndEncode reads src (plaintext or encoded), decodes it, re-encodes it
+// with the given codec, and writes the result to dst. Used for CoW.
+func copyAndEncode(src, dst string, codec FileCodec) error {
+	rawData, err := os.ReadFile(src)
 	if err != nil {
 		return err
 	}
-	defer in.Close()
-
-	out, err := os.Create(dst)
+	plaintext, err := DecodeFromDisk(rawData, codec)
 	if err != nil {
 		return err
 	}
-	defer out.Close()
-
-	_, err = io.Copy(out, in)
-	return err
+	encoded, err := EncodeToDisk(plaintext, codec)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, encoded, 0644)
 }
