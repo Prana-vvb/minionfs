@@ -607,3 +607,62 @@ func TestRemove_LowerOnlyDirectory_CreatesWhiteout(t *testing.T) {
 		}
 	}
 }
+
+// ---- Bug 7: Mkdir must not set lowerDir to a non-existent path ----
+
+// TestMkdir_LowerDirEmptyWhenNoLowerSubdir verifies that a newly created
+// directory gets an empty lowerDir when no matching subdirectory exists in
+// the lower layer. Previously Mkdir set lowerDir unconditionally, which
+// caused resolvePath inside the new Dir to produce incorrect lower paths.
+func TestMkdir_LowerDirEmptyWhenNoLowerSubdir(t *testing.T) {
+	lower, upper, cleanup := setupOverlay(t)
+	defer cleanup()
+
+	d := rootDir(lower, upper)
+	req := &fuse.MkdirRequest{Name: "brand_new", Mode: os.ModeDir | 0o755}
+
+	node, err := d.Mkdir(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Mkdir error: %v", err)
+	}
+
+	newDir, ok := node.(*Dir)
+	if !ok {
+		t.Fatalf("expected *Dir, got %T", node)
+	}
+
+	if newDir.lowerDir != "" {
+		t.Errorf("lowerDir should be empty when lower subdir doesn't exist, got %q", newDir.lowerDir)
+	}
+}
+
+// TestMkdir_LowerDirSetWhenLowerSubdirExists verifies that when a matching
+// subdirectory already exists in the lower layer, Mkdir correctly sets lowerDir
+// so that the merged view can see lower-layer contents inside the new dir.
+func TestMkdir_LowerDirSetWhenLowerSubdirExists(t *testing.T) {
+	lower, upper, cleanup := setupOverlay(t)
+	defer cleanup()
+
+	name := "shared_subdir"
+	lowerSub := filepath.Join(lower, name)
+	if err := os.MkdirAll(lowerSub, 0o755); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	d := rootDir(lower, upper)
+	req := &fuse.MkdirRequest{Name: name, Mode: os.ModeDir | 0o755}
+
+	node, err := d.Mkdir(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Mkdir error: %v", err)
+	}
+
+	newDir, ok := node.(*Dir)
+	if !ok {
+		t.Fatalf("expected *Dir, got %T", node)
+	}
+
+	if newDir.lowerDir != lowerSub {
+		t.Errorf("lowerDir should be %q, got %q", lowerSub, newDir.lowerDir)
+	}
+}

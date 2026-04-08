@@ -241,10 +241,20 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 		d.fs.DebugPrint("MKDIR", "warning: could not remove stale whiteout for", req.Name)
 	}
 
+	// Only set lowerDir if the corresponding lower subdirectory actually
+	// exists — consistent with how Lookup handles subdirectories.
+	newLowerPath := ""
+	if d.lowerDir != "" {
+		candidate := filepath.Join(d.lowerDir, req.Name)
+		if _, err := os.Lstat(candidate); err == nil {
+			newLowerPath = candidate
+		}
+	}
+
 	newDir := &Dir{
 		inode:    nextInode(),
 		upperDir: newUpperPath,
-		lowerDir: filepath.Join(d.lowerDir, req.Name),
+		lowerDir: newLowerPath,
 		fs:       d.fs,
 	}
 

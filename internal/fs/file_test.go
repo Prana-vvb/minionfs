@@ -20,6 +20,7 @@ func newTestFile(t *testing.T, upper string, name string, data []byte) *File {
 		data:      append([]byte{}, data...),
 		mode:      0o644,
 		upperPath: upperPath,
+		dirty:     true, // data was just written; treat as modified
 	}
 }
 
@@ -258,6 +259,7 @@ func TestFile_Flush_PersistsToDisk(t *testing.T) {
 		data:      []byte("flushed"),
 		mode:      0o644,
 		upperPath: upperPath,
+		dirty:     true, // simulate a file that has been written to
 	}
 
 	if err := f.Flush(context.Background(), &fuse.FlushRequest{}); err != nil {
@@ -290,6 +292,7 @@ func TestFile_Fsync_PersistsToDisk(t *testing.T) {
 		data:      []byte("synced"),
 		mode:      0o644,
 		upperPath: upperPath,
+		dirty:     true, // simulate a file that has been written to
 	}
 
 	if err := f.Fsync(context.Background(), &fuse.FsyncRequest{}); err != nil {
@@ -334,5 +337,114 @@ func TestCopyFile_MissingSrc(t *testing.T) {
 
 	if err := copyAndEncode("/nonexistent/src.txt", filepath.Join(upper, "dst.txt"), PlainCodec{}); err == nil {
 		t.Error("expected error copying from nonexistent src")
+	}
+}
+
+// ---- Bug 4: Flush must not write to upper for read-only (clean) opens ----
+
+// TestFile_Flush_CleanDoesNotWriteToUpper verifies that Flush on an unmodified
+// file (dirty=false) does not copy it to the upper layer. Without the dirty
+// flag, reading a lower-layer file through the FUSE mount would silently
+// create an upper copy on every close, defeating the read-only lower layer.
+func TestFile_Flush_CleanDoesNotWriteToUpper(t *testing.T) {
+	_, upper, cleanup := setupOverlay(t)
+	defer cleanup()
+
+	upperPath := filepath.Join(upper, "readonly.txt")
+	f := &File{
+		inode:     nextInode(),
+		data:      []byte("loaded from lower"),
+		mode:      0o644,
+		upperPath: upperPath,
+		// dirty intentionally left false — simulates Lookup without any Write
+	}
+
+	if err := f.Flush(context.Background(), &fuse.FlushRequest{}); err != nil {
+		t.Fatalf("Flush error: %v", err)
+	}
+
+	if _, err := os.Stat(upperPath); !os.IsNotExist(err) {
+		t.Error("Flush on a clean file must not create an upper-layer copy")
+	}
+}
+
+// TestFile_Fsync_CleanDoesNotWriteToUpper is the Fsync equivalent of the above.
+func TestFile_Fsync_CleanDoesNotWriteToUpper(t *testing.T) {
+	_, upper, cleanup := setupOverlay(t)
+	defer cleanup()
+
+	upperPath := filepath.Join(upper, "readonly_fsync.txt")
+	f := &File{
+		inode:     nextInode(),
+		data:      []byte("loaded from lower"),
+		mode:      0o644,
+		upperPath: upperPath,
+	}
+
+	if err := f.Fsync(context.Background(), &fuse.FsyncRequest{}); err != nil {
+		t.Fatalf("Fsync error: %v", err)
+	}
+
+	if _, err := os.Stat(upperPath); !os.IsNotExist(err) {
+		t.Error("Fsync on a clean file must not create an upper-layer copy")
+	}
+}
+
+// TestFile_Write_SetsDirty confirms that Write marks the file dirty so a
+// subsequent Flush will actually persist the data.
+func TestFile_Write_SetsDirty(t *testing.T) {
+	_, upper, cleanup := setupOverlay(t)
+	defer cleanup()
+
+	upperPath := filepath.Join(upper, "dirty_test.txt")
+	os.WriteFile(upperPath, []byte("old"), 0o644)
+
+	f := &File{
+		inode:     nextInode(),
+		data:      []byte("old"),
+		mode:      0o644,
+		upperPath: upperPath,
+	}
+
+	req := &fuse.WriteRequest{Offset: 0, Data: []byte("new")}
+	if err := f.Write(context.Background(), req, &fuse.WriteResponse{}); err != nil {
+		t.Fatalf("Write error: %v", err)
+	}
+	if !f.dirty {
+		t.Error("Write must set dirty=true")
+	}
+}
+
+// TestFile_Setattr_SetsDirtyOnMode confirms that a mode change marks the file dirty.
+func TestFile_Setattr_SetsDirtyOnMode(t *testing.T) {
+	_, upper, cleanup := setupOverlay(t)
+	defer cleanup()
+
+	f := newTestFile(t, upper, "setattr_dirty_mode.txt", []byte("x"))
+	f.dirty = false // reset — newTestFile sets dirty=true via Write
+
+	req := &fuse.SetattrRequest{Valid: fuse.SetattrMode, Mode: 0o755}
+	if err := f.Setattr(context.Background(), req, &fuse.SetattrResponse{}); err != nil {
+		t.Fatalf("Setattr error: %v", err)
+	}
+	if !f.dirty {
+		t.Error("Setattr(mode) must set dirty=true")
+	}
+}
+
+// TestFile_Setattr_SetsDirtyOnSize confirms that a truncation marks the file dirty.
+func TestFile_Setattr_SetsDirtyOnSize(t *testing.T) {
+	_, upper, cleanup := setupOverlay(t)
+	defer cleanup()
+
+	f := newTestFile(t, upper, "setattr_dirty_size.txt", []byte("hello"))
+	f.dirty = false
+
+	req := &fuse.SetattrRequest{Valid: fuse.SetattrSize, Size: 2}
+	if err := f.Setattr(context.Background(), req, &fuse.SetattrResponse{}); err != nil {
+		t.Fatalf("Setattr error: %v", err)
+	}
+	if !f.dirty {
+		t.Error("Setattr(size) must set dirty=true")
 	}
 }

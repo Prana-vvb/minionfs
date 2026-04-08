@@ -66,6 +66,7 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 
 	copy(f.data[req.Offset:], req.Data)
 	resp.Size = len(req.Data)
+	f.dirty = true
 
 	// Persist encoded data to the upper layer immediately.
 	if err := f.persistLocked(); err != nil {
@@ -82,6 +83,7 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 
 	if req.Valid.Mode() {
 		f.mode = uint32(req.Mode)
+		f.dirty = true
 	}
 
 	if req.Valid.Size() {
@@ -92,6 +94,7 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 			copy(newData, f.data)
 			f.data = newData
 		}
+		f.dirty = true
 	}
 
 	resp.Attr.Inode = f.inode
@@ -118,9 +121,9 @@ func (f *File) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
 }
 
 // persistLocked encodes f.data and writes it to upperPath.
-// Must be called with f.mu held.
+// Must be called with f.mu held. No-op if the file has not been modified.
 func (f *File) persistLocked() error {
-	if f.upperPath == "" {
+	if f.upperPath == "" || !f.dirty {
 		return nil
 	}
 	encoded, err := EncodeToDisk(f.data, f.codec)
