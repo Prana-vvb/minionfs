@@ -232,6 +232,61 @@ func TestLookup_Subdirectory(t *testing.T) {
 	}
 }
 
+// TestLookup_SubdirInBothLayers verifies that when a subdirectory exists in
+// both layers the returned Dir has both upperDir and lowerDir set correctly.
+func TestLookup_SubdirInBothLayers(t *testing.T) {
+	lower, upper, cleanup := setupOverlay(t)
+	defer cleanup()
+
+	subName := "shared_sub"
+	os.MkdirAll(filepath.Join(lower, subName), 0o755)
+	os.MkdirAll(filepath.Join(upper, subName), 0o755)
+
+	d := rootDir(lower, upper)
+	node, err := d.Lookup(context.Background(), subName)
+	if err != nil {
+		t.Fatalf("Lookup error: %v", err)
+	}
+	sub, ok := node.(*Dir)
+	if !ok {
+		t.Fatalf("expected *Dir, got %T", node)
+	}
+	if sub.upperDir != filepath.Join(upper, subName) {
+		t.Errorf("upperDir mismatch: got %q, want %q", sub.upperDir, filepath.Join(upper, subName))
+	}
+	if sub.lowerDir != filepath.Join(lower, subName) {
+		t.Errorf("lowerDir should be set when lower subdir exists, got %q", sub.lowerDir)
+	}
+}
+
+// TestLookup_SubdirLowerOnly_CreatesUpperShadow verifies that when a
+// subdirectory exists only in the lower layer, Lookup auto-creates the
+// corresponding upper shadow directory so CoW operations can proceed.
+func TestLookup_SubdirLowerOnly_CreatesUpperShadow(t *testing.T) {
+	lower, upper, cleanup := setupOverlay(t)
+	defer cleanup()
+
+	subName := "lower_sub"
+	os.MkdirAll(filepath.Join(lower, subName), 0o755)
+
+	d := rootDir(lower, upper)
+	node, err := d.Lookup(context.Background(), subName)
+	if err != nil {
+		t.Fatalf("Lookup error: %v", err)
+	}
+	sub, ok := node.(*Dir)
+	if !ok {
+		t.Fatalf("expected *Dir, got %T", node)
+	}
+
+	if _, err := os.Stat(filepath.Join(upper, subName)); err != nil {
+		t.Errorf("Lookup should auto-create upper shadow dir: %v", err)
+	}
+	if sub.lowerDir != filepath.Join(lower, subName) {
+		t.Errorf("lowerDir should point to lower subdir, got %q", sub.lowerDir)
+	}
+}
+
 // ---- ReadDirAll ----
 
 func TestReadDirAll_MergesLayers(t *testing.T) {
@@ -664,5 +719,78 @@ func TestMkdir_LowerDirSetWhenLowerSubdirExists(t *testing.T) {
 
 	if newDir.lowerDir != lowerSub {
 		t.Errorf("lowerDir should be %q, got %q", lowerSub, newDir.lowerDir)
+	}
+}
+
+// ---- EIO error paths ----
+
+// TestMkdir_UpperDirUnwritable_ReturnsEIO verifies that Mkdir returns EIO
+// when the upper directory is not writable (e.g. due to permission error).
+func TestMkdir_UpperDirUnwritable_ReturnsEIO(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("skipping: running as root bypasses permission checks")
+	}
+	lower, upper, cleanup := setupOverlay(t)
+	defer cleanup()
+
+	if err := os.Chmod(upper, 0o000); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	defer os.Chmod(upper, 0o755)
+
+	d := rootDir(lower, upper)
+	req := &fuse.MkdirRequest{Name: "fail", Mode: os.ModeDir | 0o755}
+	_, err := d.Mkdir(context.Background(), req)
+	if err != syscall.EIO {
+		t.Errorf("expected EIO for unwritable upper dir, got %v", err)
+	}
+}
+
+// TestCreate_UpperDirUnwritable_ReturnsEIO verifies that Create returns EIO
+// when the upper directory is not writable.
+func TestCreate_UpperDirUnwritable_ReturnsEIO(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("skipping: running as root bypasses permission checks")
+	}
+	lower, upper, cleanup := setupOverlay(t)
+	defer cleanup()
+
+	if err := os.Chmod(upper, 0o000); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	defer os.Chmod(upper, 0o755)
+
+	d := rootDir(lower, upper)
+	req := &fuse.CreateRequest{Name: "fail.txt", Mode: 0o644}
+	_, _, err := d.Create(context.Background(), req, &fuse.CreateResponse{})
+	if err != syscall.EIO {
+		t.Errorf("expected EIO for unwritable upper dir, got %v", err)
+	}
+}
+
+// TestRemove_LowerOnlyFile_WhiteoutFails_ReturnsEIO verifies that Remove
+// returns EIO when the upper directory is not writable and createWhiteout
+// cannot be created for a lower-only file.
+func TestRemove_LowerOnlyFile_WhiteoutFails_ReturnsEIO(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("skipping: running as root bypasses permission checks")
+	}
+	lower, upper, cleanup := setupOverlay(t)
+	defer cleanup()
+
+	name := "lower_only.txt"
+	if err := os.WriteFile(filepath.Join(lower, name), []byte("data"), 0o644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	if err := os.Chmod(upper, 0o000); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	defer os.Chmod(upper, 0o755)
+
+	d := rootDir(lower, upper)
+	req := &fuse.RemoveRequest{Name: name, Dir: false}
+	if err := d.Remove(context.Background(), req); err != syscall.EIO {
+		t.Errorf("expected EIO when whiteout creation fails, got %v", err)
 	}
 }

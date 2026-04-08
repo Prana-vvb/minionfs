@@ -283,6 +283,193 @@ func TestCopyAndEncodeChunked_MissingSrc(t *testing.T) {
 // In the chunking architecture, the underlying fd points to the lower layer for read-only
 // access, so we naturally verify that an upper file is never created without a write.
 
+// ---- Open() ----
+
+func TestFile_Open_LowerLayer_ReadOnly_NoCopy(t *testing.T) {
+	lower, upper, cleanup := setupOverlay(t)
+	defer cleanup()
+
+	lowerPath := filepath.Join(lower, "ro.txt")
+	upperPath := filepath.Join(upper, "ro.txt")
+	os.WriteFile(lowerPath, []byte("lower content"), 0o644)
+
+	f := &File{
+		inode:     nextInode(),
+		mode:      0o644,
+		upperPath: upperPath,
+		lowerPath: lowerPath,
+		codec:     PlainCodec{},
+	}
+
+	if _, err := f.Open(context.Background(), &fuse.OpenRequest{Flags: fuse.OpenFlags(os.O_RDONLY)}, &fuse.OpenResponse{}); err != nil {
+		t.Fatalf("Open error: %v", err)
+	}
+	defer f.Release(context.Background(), &fuse.ReleaseRequest{})
+
+	if _, err := os.Stat(upperPath); !os.IsNotExist(err) {
+		t.Error("upper copy should not be created for read-only open of lower-layer file")
+	}
+}
+
+func TestFile_Open_LowerLayer_WriteTriggersCoW(t *testing.T) {
+	lower, upper, cleanup := setupOverlay(t)
+	defer cleanup()
+
+	lowerPath := filepath.Join(lower, "cow_open.txt")
+	upperPath := filepath.Join(upper, "cow_open.txt")
+	os.WriteFile(lowerPath, []byte("original"), 0o644)
+
+	f := &File{
+		inode:     nextInode(),
+		mode:      0o644,
+		upperPath: upperPath,
+		lowerPath: lowerPath,
+		codec:     PlainCodec{},
+	}
+
+	if _, err := f.Open(context.Background(), &fuse.OpenRequest{Flags: fuse.OpenFlags(os.O_WRONLY)}, &fuse.OpenResponse{}); err != nil {
+		t.Fatalf("Open error: %v", err)
+	}
+	defer f.Release(context.Background(), &fuse.ReleaseRequest{})
+
+	if _, err := os.Stat(upperPath); err != nil {
+		t.Errorf("upper copy should be created by CoW on write-open: %v", err)
+	}
+	data, _ := os.ReadFile(upperPath)
+	if string(data) != "original" {
+		t.Errorf("CoW should preserve content, got %q", data)
+	}
+}
+
+// ---- Setattr with open fd (exercises fd.Chmod and codec.Truncate(fd,...) paths) ----
+
+func TestFile_Setattr_Mode_WithOpenFd(t *testing.T) {
+	_, upper, cleanup := setupOverlay(t)
+	defer cleanup()
+
+	f := newTestFile(t, upper, "mode_fd.txt", []byte("x"))
+
+	f.Open(context.Background(), &fuse.OpenRequest{Flags: fuse.OpenFlags(os.O_RDWR)}, &fuse.OpenResponse{})
+	defer f.Release(context.Background(), &fuse.ReleaseRequest{})
+
+	if err := f.Setattr(context.Background(), &fuse.SetattrRequest{Valid: fuse.SetattrMode, Mode: 0o700}, &fuse.SetattrResponse{}); err != nil {
+		t.Fatalf("Setattr error: %v", err)
+	}
+	if err := f.Flush(context.Background(), &fuse.FlushRequest{}); err != nil {
+		t.Fatalf("Flush error: %v", err)
+	}
+
+	stat, err := os.Stat(f.upperPath)
+	if err != nil {
+		t.Fatalf("Stat error: %v", err)
+	}
+	if stat.Mode().Perm() != 0o700 {
+		t.Errorf("expected mode 0700 on disk after Setattr+Flush, got %v", stat.Mode().Perm())
+	}
+}
+
+func TestFile_Setattr_TruncateShrink_WithOpenFd(t *testing.T) {
+	_, upper, cleanup := setupOverlay(t)
+	defer cleanup()
+
+	f := newTestFile(t, upper, "trunc_fd.txt", []byte("hello world"))
+
+	f.Open(context.Background(), &fuse.OpenRequest{Flags: fuse.OpenFlags(os.O_RDWR)}, &fuse.OpenResponse{})
+	defer f.Release(context.Background(), &fuse.ReleaseRequest{})
+
+	if err := f.Setattr(context.Background(), &fuse.SetattrRequest{Valid: fuse.SetattrSize, Size: 5}, &fuse.SetattrResponse{}); err != nil {
+		t.Fatalf("Setattr error: %v", err)
+	}
+	if err := f.Flush(context.Background(), &fuse.FlushRequest{}); err != nil {
+		t.Fatalf("Flush error: %v", err)
+	}
+
+	stat, err := os.Stat(f.upperPath)
+	if err != nil {
+		t.Fatalf("Stat error: %v", err)
+	}
+	if stat.Size() != 5 {
+		t.Errorf("expected size 5 after Setattr truncate+Flush, got %d", stat.Size())
+	}
+}
+
+func TestFile_Setattr_TruncateGrow_WithOpenFd(t *testing.T) {
+	_, upper, cleanup := setupOverlay(t)
+	defer cleanup()
+
+	f := newTestFile(t, upper, "grow_fd.txt", []byte("hi"))
+
+	f.Open(context.Background(), &fuse.OpenRequest{Flags: fuse.OpenFlags(os.O_RDWR)}, &fuse.OpenResponse{})
+	defer f.Release(context.Background(), &fuse.ReleaseRequest{})
+
+	if err := f.Setattr(context.Background(), &fuse.SetattrRequest{Valid: fuse.SetattrSize, Size: 10}, &fuse.SetattrResponse{}); err != nil {
+		t.Fatalf("Setattr error: %v", err)
+	}
+	if err := f.Flush(context.Background(), &fuse.FlushRequest{}); err != nil {
+		t.Fatalf("Flush error: %v", err)
+	}
+
+	stat, err := os.Stat(f.upperPath)
+	if err != nil {
+		t.Fatalf("Stat error: %v", err)
+	}
+	if stat.Size() != 10 {
+		t.Errorf("expected size 10 after Setattr grow+Flush, got %d", stat.Size())
+	}
+}
+
+// ---- copyAndEncodeChunked: typePlain magic header and unreadable source ----
+
+// TestCopyAndEncodeChunked_TypePlainHeader verifies that a source file with a
+// magic header using the typePlain type byte (0x00) is treated as a raw
+// PlainCodec file — bytes including the header are copied verbatim.
+func TestCopyAndEncodeChunked_TypePlainHeader(t *testing.T) {
+	lower, upper, cleanup := setupOverlay(t)
+	defer cleanup()
+
+	src := filepath.Join(lower, "plain_header.bin")
+	dst := filepath.Join(upper, "plain_header_copy.bin")
+
+	var content []byte
+	content = append(content, magicPrefix...)
+	content = append(content, typePlain)
+	content = append(content, []byte("raw content follows")...)
+	if err := os.WriteFile(src, content, 0o644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	if err := copyAndEncodeChunked(src, dst, PlainCodec{}); err != nil {
+		t.Fatalf("copyAndEncodeChunked error: %v", err)
+	}
+
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("ReadFile error: %v", err)
+	}
+	if string(got) != string(content) {
+		t.Errorf("typePlain-header file should be copied verbatim: got %q, want %q", got, content)
+	}
+}
+
+func TestCopyAndEncodeChunked_UnreadableSrc(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("skipping: running as root bypasses permission checks")
+	}
+	lower, upper, cleanup := setupOverlay(t)
+	defer cleanup()
+
+	src := filepath.Join(lower, "unreadable.txt")
+	if err := os.WriteFile(src, []byte("data"), 0o644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	os.Chmod(src, 0o000)
+	defer os.Chmod(src, 0o644)
+
+	if err := copyAndEncodeChunked(src, filepath.Join(upper, "dst.txt"), PlainCodec{}); err == nil {
+		t.Error("expected error copying from unreadable source, got nil")
+	}
+}
+
 func TestFile_CleanDoesNotWriteToUpper(t *testing.T) {
 	lower, upper, cleanup := setupOverlay(t)
 	defer cleanup()
