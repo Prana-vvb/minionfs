@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"bazil.org/fuse"
@@ -39,27 +40,28 @@ func createWhiteout(upperDir, name string) error {
 
 func (d *Dir) resolvePath(name string) (fullPath string, layer string, err error) {
 	// Step 1: Check for whiteout in upper layer first.
-	// If a whiteout exists, the file is considered deleted.
-	if isWhiteout(d.upperDir, name) {
+	// Only relevant when a lower layer exists — whiteouts exist to hide lower-layer
+	// files. Skip this check entirely for upper-only dirs (e.g. created via Mkdir).
+	if d.lowerDir != "" && isWhiteout(d.upperDir, name) {
 		return "", "", syscall.ENOENT
 	}
 
 	upperPath := filepath.Join(d.upperDir, name)
 	lowerPath := filepath.Join(d.lowerDir, name)
 
-	// Step 2: Check upper layer
-	if _, err := os.Lstat(upperPath); err == nil {
+	// Step 2: Check upper layer.
+	if _, statErr := os.Lstat(upperPath); statErr == nil {
 		return upperPath, "upper", nil
 	}
 
-	// Step 3: Check lower layer (only if lowerDir is set)
+	// Step 3: Check lower layer (only if lowerDir is set).
 	if d.lowerDir != "" {
-		if _, err := os.Lstat(lowerPath); err == nil {
+		if _, statErr := os.Lstat(lowerPath); statErr == nil {
 			return lowerPath, "lower", nil
 		}
 	}
 
-	// Step 4: File not found in either layer
+	// Step 4: File not found in either layer.
 	return "", "", syscall.ENOENT
 }
 
@@ -92,12 +94,12 @@ func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 		upperSub := filepath.Join(d.upperDir, name)
 		lowerSub := filepath.Join(d.lowerDir, name)
 
-		// Only set lowerDir if the subdirectory actually exists in the lower layer
+		// Only set lowerDir if the subdirectory actually exists in the lower layer.
 		if _, err := os.Lstat(lowerSub); err != nil {
 			lowerSub = ""
 		}
 
-		// Ensure the upper subdir exists so that CoW writes and Flush don't fail
+		// Ensure the upper subdir exists so that CoW writes and Flush don't fail.
 		if _, err := os.Lstat(upperSub); os.IsNotExist(err) {
 			if mkErr := os.MkdirAll(upperSub, 0o755); mkErr != nil {
 				return nil, syscall.EIO
@@ -139,11 +141,11 @@ func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 
 	seen := make(map[string]fuse.DirentType)
 
-	// Read upper layer — skip whiteout marker files themselves
+	// Read upper layer.
 	if entries, err := os.ReadDir(d.upperDir); err == nil {
 		for _, e := range entries {
-			// Don't expose whiteout marker files in the merged view
-			if len(e.Name()) > len(whiteoutPrefix) && e.Name()[:len(whiteoutPrefix)] == whiteoutPrefix {
+			// Don't expose whiteout marker files in the merged view.
+			if strings.HasPrefix(e.Name(), whiteoutPrefix) {
 				continue
 			}
 			if e.IsDir() {
@@ -154,18 +156,24 @@ func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 		}
 	}
 
-	// Read lower layer — skip names already in upper, and skip whited-out files
+	// Read lower layer — skip names already in upper, and skip whited-out files.
 	if d.lowerDir != "" {
 		if entries, err := os.ReadDir(d.lowerDir); err == nil {
 			for _, e := range entries {
-				// Skip if already seen from upper layer
+				if strings.HasPrefix(e.Name(), whiteoutPrefix) {
+					continue
+				}
+
+				// Skip if already seen from upper layer.
 				if _, exists := seen[e.Name()]; exists {
 					continue
 				}
-				// Skip if a whiteout exists for this file in the upper layer
+
+				// Skip if a whiteout exists for this file in the upper layer.
 				if isWhiteout(d.upperDir, e.Name()) {
 					continue
 				}
+
 				if e.IsDir() {
 					seen[e.Name()] = fuse.DT_Dir
 				} else {
@@ -287,7 +295,7 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 		return syscall.ENOENT
 	}
 
-	// Remove the upper copy if it exists (file or directory)
+	// Remove the upper copy if it exists (file or directory).
 	if inUpper {
 		var removeErr error
 		if req.Dir {
