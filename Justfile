@@ -17,14 +17,32 @@ build:
     go build -o {{bin_name}} ./cmd/minionfs
 
 # Run the filesystem (Usage: just run <folder_name>)
-run ldir udir mnt dbg="":
+run ldir udir mnt *flags:
     #!/usr/bin/env bash
+    set -e
+
+    HAS_ENC=0
+    HAS_COMP=0
+
+    for arg in {{flags}}; do
+        if [[ "$arg" == "--encrypt-key" ]]; then
+            HAS_ENC=1
+        elif [[ "$arg" == "--compress" ]]; then
+            HAS_COMP=1
+        fi
+    done
+
+    if [[ $HAS_ENC -eq 1 && $HAS_COMP -eq 1 ]]; then
+        echo "Error: '--encrypt' and '--compress' are mutually exclusive." >&2
+        exit 1
+    fi
+
     mkdir -p {{ldir}} {{udir}} {{mnt}}
 
     if [[ -f {{bin_name}} ]]; then
-        ./{{bin_name}} {{dbg}} {{ldir}} {{udir}} {{mnt}}
+        ./{{bin_name}} {{flags}} {{ldir}} {{udir}} {{mnt}}
     else
-        go run ./cmd/minionfs {{dbg}} {{ldir}} {{udir}} {{mnt}}
+        go run ./cmd/minionfs {{flags}} {{ldir}} {{udir}} {{mnt}}
     fi
 
 # Clean up bin
@@ -44,6 +62,4 @@ check:
 
 # Summary percentage, Per-function breakdown, Interactive HTML coverage report
 test:
-    go test ./internal/fs/ -cover
-    go test ./internal/fs/ -coverprofile=coverage.out && go tool cover -func=coverage.out
-    go test ./internal/fs/ -coverprofile=coverage.out && go tool cover -html=coverage.out
+    go test ./internal/fs/ -v -coverprofile=coverage.out && go tool cover -html=coverage.out
