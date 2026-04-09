@@ -47,7 +47,7 @@ run ldir udir mnt *flags:
 
 # Clean up bin
 clean:
-    rm -rf bin
+    rm -rf bin *.out
     go clean
 
 # Force unmount if the app crashes
@@ -60,6 +60,7 @@ check:
     go vet ./...
     go mod tidy
 
-# Summary percentage, Per-function breakdown, Interactive HTML coverage report
+# Go tests and given project test script
 test:
     go test ./internal/fs/ -v -coverprofile=coverage.out && go tool cover -html=coverage.out
+    ./test_unionfs.sh
